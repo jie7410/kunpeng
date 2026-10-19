@@ -10,7 +10,7 @@
 
 > `Agent` 负责“怎么对话、怎么调工具”，`Model/Provider` 负责“怎么发请求”，`OpenAI/Anthropic 适配器` 负责“把统一消息翻译成各家协议”，UI 只负责“显示事件、决定是否允许工具执行”。
 
-核心代码在 `kunpeng::llm` library 中，`src/main.rs` 只是一个 CLI 消费示例。Tauri 或其他 UI 可以替换 `main.rs`，复用同一套内核。
+核心代码在 `kunpeng::llm` library 中，`src/main.rs` 只是一个交互式 CLI 消费示例。Tauri 或其他 UI 可以替换 `main.rs`，复用同一套内核。
 
 ---
 
@@ -72,7 +72,7 @@ UI → Agent → Model → Provider → Protocol → 具体适配器
 ```text
 src/
 ├── lib.rs                    公开 library，只导出 llm 模块
-├── main.rs                   CLI 示例：配置 → 注册工具 → Agent → 事件打印
+├── main.rs                   交互式 CLI：输入循环 → Agent → 事件打印
 └── llm/
     ├── mod.rs                分层说明与公开 re-export
     ├── types.rs              协议无关的消息/请求/响应/工具调用类型
@@ -83,7 +83,7 @@ src/
     ├── agent.rs              Agent：历史、循环、事件、审批、取消、超时
     └── provider/
         ├── mod.rs            Provider：HTTP Client、base_url、API key、重试
-        ├── protocol.rs       Protocol trait、CallContext、重试/解析/截断
+        ├── protocol.rs       Protocol trait、SSE 解码、重试/解析/截断
         ├── openai.rs         OpenAI Chat Completions 适配器
         └── anthropic.rs      Anthropic Messages API 适配器
 ```
@@ -107,12 +107,16 @@ sequenceDiagram
     A->>A: history.push(user)
 
     loop 最多 max_turns 次模型请求
-        A->>M: chat(&ChatRequest)
-        Note right of A: 请求借用 history 和工具定义
-        M->>P: chat(model, &req)
-        P->>AD: chat(&CallContext, &req)
-        AD->>API: POST /chat/completions 或 /v1/messages
-        API-->>AD: JSON
+        A->>M: chat_stream(&ChatRequest, on_delta)
+        Note right of A: stream=false 时改走 chat()
+        M->>P: chat_stream(model, &req, on_delta)
+        P->>AD: chat_stream(&CallContext, &req, on_delta)
+        AD->>API: POST /chat/completions 或 /v1/messages（stream=true）
+        loop SSE chunks
+            API-->>AD: data / event
+            AD-->>A: on_delta(text)
+            A-->>UI: AgentEvent::AssistantDelta
+        end
         AD-->>P: ChatResponse（统一类型）
         P-->>M: ChatResponse
         M-->>A: ChatResponse
@@ -232,10 +236,10 @@ Deny(reason) → 不执行，写入 is_error 的 tool_result
 `AgentEvent` 是普通可序列化数据：
 
 ```text
-Assistant → (ToolStarted → ToolFinished)* → Finished
+AssistantDelta* → Assistant → (ToolStarted → ToolFinished)* → Finished
 ```
 
-失败时由 `Error` 事件替代 `Finished`。
+`AssistantDelta` 只是展示用的临时文本；最终内容以 `Assistant` 为准。失败或取消时，UI 应丢弃增量缓冲。失败时由 `Error` 事件替代 `Finished`。
 
 Tauri 可以直接把事件 `emit` 给前端；CLI 直接打印；测试收集到 `Vec` 里断言。内核不依赖任何 UI 类型。
 
@@ -244,6 +248,19 @@ Tauri 可以直接把事件 `emit` 给前端；CLI 直接打印；测试收集�
 - 取消令牌只在模型请求上 `select!`，可以立即 drop HTTP 请求；
 - 工具执行期间不中途取消，只在工具之间检查，避免留下子进程；
 - 单个工具的硬上限由 `AgentConfig::tool_timeout` 控制。
+
+### 9. 流式在协议层收敛，Agent 只消费文本增量
+
+`Protocol::chat_stream` 的默认实现退回 `chat`，把完整文本作为单个增量发出。新增 provider 可以先只实现非流式，Agent 不需要判断对方是否支持 SSE。
+
+两个适配器各自处理 SSE：
+
+- 共用 `SseDecoder`：跨 chunk 缓冲、按行解析、处理 CRLF/多行 `data:`；
+- OpenAI：按 `tool_calls[].index` 累积 id/name/arguments 分片，`[DONE]` 结束；
+- Anthropic：文本走 `text_delta`，工具参数走 `input_json_delta`，按 content block index 累积；
+- 最终都组装成同一个 `ChatResponse`，Agent 的工具循环与非流式完全一致。
+
+`AgentConfig::stream` 默认开启。不支持 SSE 的兼容端点设为 `false`；流式请求的 usage 取决于服务端是否主动发送。
 
 ---
 
@@ -257,6 +274,7 @@ Tauri 可以直接把事件 `emit` 给前端；CLI 直接打印；测试收集�
 | 模型因 token 上限停止 | `StopReason::Length` | 末尾是 assistant，正文可能被截断 |
 | 内容被安全策略过滤 | `StopReason::ContentFilter` | 末尾是 assistant |
 | 模型请求失败 | 返回 `Err`，发 `Error` 事件 | 不追加消息，可 `resume()` |
+| 流式中途失败/取消 | 返回 `Err` / `StopReason::Cancelled` | 不追加 assistant；UI 丢弃增量缓冲 |
 | 工具失败/超时/被拒绝 | 循环继续 | 写入 `is_error=true` 的 tool_result |
 | 用户取消 | `StopReason::Cancelled` | 给未完成调用补取消结果，可继续 |
 
@@ -309,7 +327,6 @@ Tauri 可以直接把事件 `emit` 给前端；CLI 直接打印；测试收集�
 
 这些是已知的、有意保留的后续项：
 
-- **流式输出**未实现，当前只有非流式请求；
 - Anthropic 的 `thinking`、服务端工具等未知 block 会被忽略，启用 extended thinking 前需要保存原始 block；
 - 没有上下文窗口裁剪，长会话仍可能超过模型上限；
 - 工具审批是同步回调，Tauri 若需要真正异步等待用户确认，需要扩展成 async approver。

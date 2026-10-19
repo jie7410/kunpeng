@@ -9,13 +9,14 @@
 //! - 工具参数在 JSON 里是**字符串**，内部类型是 `Value`，两侧都要显式转换。
 
 use super::protocol::{
-    api_error, parse_response, send_with_retry, truncate, CallContext, Protocol,
+    api_error, consume_sse, is_event_stream, parse_response, send_with_retry, truncate,
+    CallContext, Protocol,
 };
 use crate::llm::error::{Error, Result};
 use crate::llm::types::{ChatRequest, ChatResponse, FinishReason, Message, ToolCall, Usage};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::BTreeMap};
 
 pub struct OpenAiProtocol;
 
@@ -24,30 +25,7 @@ impl Protocol for OpenAiProtocol {
     async fn chat(&self, ctx: &CallContext<'_>, req: &ChatRequest<'_>) -> Result<ChatResponse> {
         // 请求体只借用历史与工具定义：消息内容和 id 都不复制，只有工具参数
         // 因为协议要求字符串而重新序列化。
-        let body = OpenAiRequest {
-            model: ctx.model,
-            messages: req.messages.iter().map(to_openai_message).collect(),
-            // 空数组和“不传”在部分兼容端点上行为不同，显式用 None 省略字段。
-            tools: if req.tools.is_empty() {
-                None
-            } else {
-                Some(
-                    req.tools
-                        .iter()
-                        .map(|tool| OpenAiTool {
-                            r#type: "function",
-                            function: OpenAiFunction {
-                                name: &tool.name,
-                                description: &tool.description,
-                                parameters: &tool.input_schema,
-                            },
-                        })
-                        .collect(),
-                )
-            },
-            temperature: req.temperature,
-            max_tokens: req.max_tokens,
-        };
+        let body = build_body(ctx.model, req, false);
 
         // base_url 约定包含版本前缀（如 /v1），这里只拼资源路径。
         // 闭包会在每次重试时重新构造并序列化请求体。
@@ -70,43 +48,195 @@ impl Protocol for OpenAiProtocol {
         // 不直接 response.json()：解析失败时要把 body 片段带进错误。
         let raw = response.text().await?;
         let parsed: OpenAiResponse = parse_response("openai", &raw)?;
+        into_chat_response(parsed, ctx.model)
+    }
 
-        // 没有传 n，默认只返回一个 choice。多 choice 属于另一套交互模型，
-        // Agent 的循环只消费第一个。
-        let choice = parsed
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Other("OpenAI 响应 choices 为空".into()))?;
+    /// 流式请求。OpenAI 的 tool_calls 参数会分片到达，按 `index` 累积后
+    /// 再一次性解析；文本分片通过 `on_delta` 立即交给 UI。
+    async fn chat_stream(
+        &self,
+        ctx: &CallContext<'_>,
+        req: &ChatRequest<'_>,
+        on_delta: &mut (dyn FnMut(String) + Send),
+    ) -> Result<ChatResponse> {
+        let body = build_body(ctx.model, req, true);
+        let response = send_with_retry(ctx.max_retries, || {
+            ctx.http
+                .post(format!("{}/chat/completions", ctx.base_url))
+                .bearer_auth(ctx.api_key)
+                .json(&body)
+        })
+        .await?;
 
-        let tool_calls = choice
-            .message
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .map(|call| {
-                let arguments =
-                    parse_tool_arguments(&call.function.name, &call.function.arguments)?;
-                Ok(ToolCall {
-                    id: call.id,
-                    name: call.function.name,
-                    arguments,
-                })
-            })
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(api_error(status, body));
+        }
+
+        // 兼容端点可能忽略 stream=true，直接返回 JSON。按 content-type 回退，
+        // 避免把一份普通响应当成空的 SSE 流。
+        if !is_event_stream(&response) {
+            let raw = response.text().await?;
+            let parsed: OpenAiResponse = parse_response("openai", &raw)?;
+            return into_chat_response(parsed, ctx.model);
+        }
+
+        let mut content = String::new();
+        let mut model = None;
+        let mut usage = None;
+        let mut finish_reason = None;
+        let mut tool_calls: BTreeMap<usize, ToolCallAccum> = BTreeMap::new();
+        let mut done = false;
+
+        consume_sse(response, |event| {
+            if done || event.data.is_empty() {
+                return Ok(());
+            }
+            if event.data.trim() == "[DONE]" {
+                done = true;
+                return Ok(());
+            }
+
+            let parsed: OpenAiStreamResponse = parse_response("openai", &event.data)?;
+            if let Some(error) = parsed.error {
+                return Err(Error::Other(format!("OpenAI 流错误: {}", error.message)));
+            }
+            if let Some(value) = parsed.model {
+                if !value.is_empty() {
+                    model = Some(value);
+                }
+            }
+            if let Some(value) = parsed.usage {
+                usage = Some(value.into());
+            }
+
+            for choice in parsed.choices {
+                if let Some(text) = choice.delta.content {
+                    if !text.is_empty() {
+                        content.push_str(&text);
+                        on_delta(text);
+                    }
+                }
+
+                if let Some(calls) = choice.delta.tool_calls {
+                    for call in calls {
+                        let accumulator = tool_calls.entry(call.index).or_default();
+                        if let Some(id) = call.id {
+                            accumulator.id = Some(id);
+                        }
+                        if let Some(function) = call.function {
+                            if let Some(name) = function.name {
+                                accumulator.name = Some(name);
+                            }
+                            if let Some(arguments) = function.arguments {
+                                accumulator.arguments.push_str(&arguments);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(reason) = choice.finish_reason {
+                    finish_reason = Some(FinishReason::from_openai(&reason));
+                }
+            }
+            Ok(())
+        })
+        .await?;
+
+        let tool_calls = tool_calls
+            .into_values()
+            .map(ToolCallAccum::into_tool_call)
             .collect::<Result<Vec<_>>>()?;
 
         Ok(ChatResponse {
-            // 空字符串统一成 None：部分兼容端点会返回 ""，UI 不应显示空气泡，
-            // Anthropic 也不接受空的 assistant text block。
-            content: choice.message.content.filter(|content| !content.is_empty()),
+            content: if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            },
             tool_calls,
-            model: parsed.model,
-            usage: parsed.usage.map(Into::into),
-            finish_reason: choice
-                .finish_reason
-                .as_deref()
-                .map(FinishReason::from_openai),
+            model: model.unwrap_or_else(|| ctx.model.to_string()),
+            usage,
+            finish_reason,
         })
+    }
+}
+
+/// 普通响应 JSON → 统一 `ChatResponse`。非流式和“服务端忽略 stream”的回退共用。
+fn into_chat_response(parsed: OpenAiResponse, fallback_model: &str) -> Result<ChatResponse> {
+    let OpenAiResponse {
+        model,
+        choices,
+        usage,
+    } = parsed;
+
+    // 没有传 n，默认只返回一个 choice。多 choice 属于另一套交互模型，
+    // Agent 的循环只消费第一个。
+    let choice = choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Other("OpenAI 响应 choices 为空".into()))?;
+
+    let tool_calls = choice
+        .message
+        .tool_calls
+        .unwrap_or_default()
+        .into_iter()
+        .map(|call| {
+            let arguments = parse_tool_arguments(&call.function.name, &call.function.arguments)?;
+            Ok(ToolCall {
+                id: call.id,
+                name: call.function.name,
+                arguments,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(ChatResponse {
+        // 空字符串统一成 None：部分兼容端点会返回 ""，UI 不应显示空气泡，
+        // Anthropic 也不接受空的 assistant text block。
+        content: choice.message.content.filter(|content| !content.is_empty()),
+        tool_calls,
+        model: if model.is_empty() {
+            fallback_model.to_string()
+        } else {
+            model
+        },
+        usage: usage.map(Into::into),
+        finish_reason: choice
+            .finish_reason
+            .as_deref()
+            .map(FinishReason::from_openai),
+    })
+}
+
+/// 构造请求体。非流式不发送 `stream` 字段，避免兼容端点对未知/多余字段敏感。
+fn build_body<'a>(model: &'a str, req: &'a ChatRequest<'a>, stream: bool) -> OpenAiRequest<'a> {
+    OpenAiRequest {
+        model,
+        messages: req.messages.iter().map(to_openai_message).collect(),
+        // 空数组和“不传”在部分兼容端点上行为不同，显式用 None 省略字段。
+        tools: if req.tools.is_empty() {
+            None
+        } else {
+            Some(
+                req.tools
+                    .iter()
+                    .map(|tool| OpenAiTool {
+                        r#type: "function",
+                        function: OpenAiFunction {
+                            name: &tool.name,
+                            description: &tool.description,
+                            parameters: &tool.input_schema,
+                        },
+                    })
+                    .collect(),
+            )
+        },
+        temperature: req.temperature,
+        max_tokens: req.max_tokens,
+        stream: stream.then_some(true),
     }
 }
 
@@ -204,6 +334,9 @@ struct OpenAiRequest<'a> {
     /// 目标是 Chat Completions 兼容端点，智谱等实现仍使用旧字段。
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// 非流式请求省略该字段；流式时显式传 true。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 /// 工具声明。OpenAI 用 `{type:"function", function:{...}}` 包一层，
@@ -286,7 +419,7 @@ struct OpenAiRespCallFunction {
 
 /// usage 字段名以 OpenAI 为准。`completion_tokens` 是复数；写错时 serde 的
 /// `default` 会把它静默变成 0，所以有单独的测试固定这个字段。
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct OpenAiUsage {
     #[serde(default)]
     prompt_tokens: u32,
@@ -303,6 +436,81 @@ impl From<OpenAiUsage> for Usage {
             completion_tokens: usage.completion_tokens,
             total_tokens: usage.total_tokens,
         }
+    }
+}
+
+/// 流式 chunk。`choices` 可能为空（例如只带 usage 的最后一帧）。
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct OpenAiStreamResponse {
+    model: Option<String>,
+    choices: Vec<OpenAiStreamChoice>,
+    usage: Option<OpenAiUsage>,
+    error: Option<OpenAiStreamError>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct OpenAiStreamChoice {
+    delta: OpenAiStreamDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct OpenAiStreamDelta {
+    content: Option<String>,
+    tool_calls: Option<Vec<OpenAiStreamToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamToolCall {
+    /// 同一条回复里多个工具调用的分片共用一个 index。
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<OpenAiStreamFunction>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct OpenAiStreamFunction {
+    name: Option<String>,
+    /// JSON 字符串的分片，需要按顺序拼接。
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamError {
+    #[serde(default)]
+    message: String,
+}
+
+/// 累积一个工具调用的分片。id/name 通常只在第一帧出现，arguments 可能拆成很多帧。
+#[derive(Debug, Default)]
+struct ToolCallAccum {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl ToolCallAccum {
+    fn into_tool_call(self) -> Result<ToolCall> {
+        let id = self
+            .id
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Error::Other("OpenAI 流式工具调用缺少 id".into()))?;
+        let name = self
+            .name
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Error::Other("OpenAI 流式工具调用缺少 name".into()))?;
+        let arguments = parse_tool_arguments(&name, &self.arguments)?;
+        Ok(ToolCall {
+            id,
+            name,
+            arguments,
+        })
     }
 }
 

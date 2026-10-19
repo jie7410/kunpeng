@@ -6,7 +6,7 @@
 use crate::llm::error::{Error, Result};
 use crate::llm::types::{ChatRequest, ChatResponse};
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, RETRY_AFTER};
+use reqwest::header::{HeaderMap, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{RequestBuilder, Response, StatusCode};
 use std::time::Duration;
 
@@ -29,6 +29,156 @@ pub struct CallContext<'a> {
 #[async_trait]
 pub trait Protocol: Send + Sync {
     async fn chat(&self, ctx: &CallContext<'_>, req: &ChatRequest<'_>) -> Result<ChatResponse>;
+
+    /// 流式调用。默认实现退回非流式，并把完整文本作为单个增量发出去，
+    /// 这样新增 provider 可以先只实现 `chat`，Agent 不需要知道它是否支持 SSE。
+    ///
+    /// 回调只发文本增量；工具调用的参数分片由适配器自行累积，最终放进
+    /// `ChatResponse.tool_calls`。UI 不应把增量当成最终消息，收到
+    /// `AgentEvent::Assistant` 后再以完整内容为准。
+    async fn chat_stream(
+        &self,
+        ctx: &CallContext<'_>,
+        req: &ChatRequest<'_>,
+        on_delta: &mut (dyn FnMut(String) + Send),
+    ) -> Result<ChatResponse> {
+        let response = self.chat(ctx, req).await?;
+        if let Some(content) = &response.content {
+            on_delta(content.clone());
+        }
+        Ok(response)
+    }
+}
+
+/// 一条 SSE 事件。`event` 对应 `event:` 字段，`data` 是拼接后的 `data:` 内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SseEvent {
+    pub event: Option<String>,
+    pub data: String,
+}
+
+/// 增量 SSE 解码器。
+///
+/// 网络 chunk 不按行切分，可能把一行 JSON、甚至一个 UTF-8 字符切成两半，所以
+/// 这里保留原始字节缓冲，只按 `\n` 取完整行。行内的 `\r` 和 `data:` 后可选空格
+/// 按 SSE 规范处理。
+#[derive(Default)]
+pub(crate) struct SseDecoder {
+    buffer: Vec<u8>,
+    event: Option<String>,
+    data: String,
+}
+
+impl SseDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 喂入一个网络 chunk，返回其中已经完整的事件。
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
+        self.buffer.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line: Vec<u8> = self.buffer.drain(..=index).collect();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let line = String::from_utf8_lossy(&line);
+            self.process_line(line.as_ref(), &mut events);
+        }
+        events
+    }
+
+    /// 流结束时调用。部分服务端最后一帧没有空行，需要把残留行补处理掉。
+    pub fn finish(&mut self) -> Option<SseEvent> {
+        if !self.buffer.is_empty() {
+            let mut line = std::mem::take(&mut self.buffer);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let line = String::from_utf8_lossy(&line);
+            let mut events = Vec::new();
+            self.process_line(line.as_ref(), &mut events);
+            if let Some(event) = events.into_iter().next() {
+                return Some(event);
+            }
+        }
+        self.dispatch()
+    }
+
+    fn process_line(&mut self, line: &str, events: &mut Vec<SseEvent>) {
+        if line.is_empty() {
+            if let Some(event) = self.dispatch() {
+                events.push(event);
+            }
+            return;
+        }
+        // 注释行，例如 `: keep-alive`。
+        if line.starts_with(':') {
+            return;
+        }
+        let Some((field, value)) = line.split_once(':') else {
+            return;
+        };
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "event" => self.event = Some(value.to_string()),
+            "data" => {
+                if !self.data.is_empty() {
+                    self.data.push('\n');
+                }
+                self.data.push_str(value);
+            }
+            // id/retry 等字段目前用不到；未知字段按规范忽略。
+            _ => {}
+        }
+    }
+
+    fn dispatch(&mut self) -> Option<SseEvent> {
+        if self.data.is_empty() {
+            // 只有 event 没有 data 的事件不完整，直接丢弃，避免把心跳当数据。
+            self.event = None;
+            return None;
+        }
+        Some(SseEvent {
+            event: self.event.take(),
+            data: std::mem::take(&mut self.data),
+        })
+    }
+}
+
+/// 判断响应是否是 SSE。
+///
+/// 有些兼容端点在 `stream=true` 时仍返回普通 JSON；如果直接按 SSE 解码，会得到
+/// 空回复。header 缺失时按 SSE 处理，避免误伤正常流式服务。
+pub(crate) fn is_event_stream(response: &Response) -> bool {
+    response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+        .unwrap_or(true)
+}
+
+/// 逐块读取响应体并解码 SSE 事件。
+///
+/// 用 `Response::chunk()` 而不是引入额外 stream 依赖；LLM SSE 的吞吐量远低于
+/// 每次 chunk 的调度成本。
+pub(crate) async fn consume_sse(
+    mut response: Response,
+    mut on_event: impl FnMut(SseEvent) -> Result<()>,
+) -> Result<()> {
+    let mut decoder = SseDecoder::new();
+    while let Some(chunk) = response.chunk().await? {
+        for event in decoder.push(&chunk) {
+            on_event(event)?;
+        }
+    }
+    if let Some(event) = decoder.finish() {
+        on_event(event)?;
+    }
+    Ok(())
 }
 
 /// 对 408/429/5xx 做有上限的重试。
@@ -112,4 +262,72 @@ pub(crate) fn truncate(value: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     format!("{}…", &value[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_event_split_across_chunks() {
+        let mut decoder = SseDecoder::new();
+        assert!(decoder
+            .push(b"event: content_block_delta\ndata: {\"a\":")
+            .is_empty());
+
+        let events = decoder.push(b"1}\n\n");
+        assert_eq!(
+            events,
+            vec![SseEvent {
+                event: Some("content_block_delta".into()),
+                data: r#"{"a":1}"#.into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn handles_crlf_comments_and_multiline_data() {
+        let mut decoder = SseDecoder::new();
+        let events = decoder.push(b": keep-alive\r\ndata: first\r\ndata: second\r\n\r\n");
+        assert_eq!(
+            events,
+            vec![SseEvent {
+                event: None,
+                data: "first\nsecond".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn finish_flushes_event_without_trailing_blank_line() {
+        let mut decoder = SseDecoder::new();
+        assert!(decoder.push(b"data: tail").is_empty());
+        assert_eq!(
+            decoder.finish(),
+            Some(SseEvent {
+                event: None,
+                data: "tail".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn split_utf8_is_not_corrupted() {
+        let mut decoder = SseDecoder::new();
+        let payload = "data: 北京\n\n".as_bytes();
+        let split = payload
+            .windows(3)
+            .position(|window| window == "北".as_bytes())
+            .unwrap()
+            + 1;
+        assert!(decoder.push(&payload[..split]).is_empty());
+        let events = decoder.push(&payload[split..]);
+        assert_eq!(
+            events,
+            vec![SseEvent {
+                event: None,
+                data: "北京".into(),
+            }]
+        );
+    }
 }

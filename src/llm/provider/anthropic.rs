@@ -10,41 +10,22 @@
 //! 注意：响应里的未知 block（extended thinking、服务端工具等）目前会被忽略。
 //! 启用这些能力前需要把原始 block 存进历史并原样回放，否则多轮请求会被拒绝。
 
-use super::protocol::{api_error, parse_response, send_with_retry, CallContext, Protocol};
-use crate::llm::error::Result;
+use super::protocol::{
+    api_error, consume_sse, is_event_stream, parse_response, send_with_retry, truncate,
+    CallContext, Protocol,
+};
+use crate::llm::error::{Error, Result};
 use crate::llm::types::{ChatRequest, ChatResponse, FinishReason, Message, ToolCall, Usage};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub struct AnthropicProtocol;
 
 #[async_trait]
 impl Protocol for AnthropicProtocol {
     async fn chat(&self, ctx: &CallContext<'_>, req: &ChatRequest<'_>) -> Result<ChatResponse> {
-        let body = AnthropicRequest {
-            model: ctx.model,
-            // 语义层允许多条 system，Anthropic 只接受一个顶层字符串。
-            system: system_prompt(req.messages),
-            messages: to_anthropic_messages(req.messages),
-            tools: if req.tools.is_empty() {
-                None
-            } else {
-                Some(
-                    req.tools
-                        .iter()
-                        .map(|tool| AnthropicTool {
-                            name: &tool.name,
-                            description: &tool.description,
-                            input_schema: &tool.input_schema,
-                        })
-                        .collect(),
-                )
-            },
-            temperature: req.temperature,
-            // 必填。1024 对带工具/长解释的回复太小，容易在不知情的情况下截断；
-            // 需要更严格的上限时由调用方显式传 max_tokens。
-            max_tokens: req.max_tokens.unwrap_or(4096),
-        };
+        let body = build_body(ctx.model, req, false);
 
         // base_url 可能已经带 /v1（很多代理会这样配），messages_url 负责去重。
         // 重试闭包每次重新序列化 body。
@@ -65,42 +46,269 @@ impl Protocol for AnthropicProtocol {
 
         let raw = response.text().await?;
         let parsed: AnthropicResponse = parse_response("anthropic", &raw)?;
+        Ok(into_chat_response(parsed, ctx.model))
+    }
 
-        // content 是 block 数组：text 可能有多段，tool_use 可以有多个。
-        // 纯文本拼接成一条 assistant content；工具调用单独收集。
+    /// 流式请求。
+    ///
+    /// Anthropic 的文本和工具参数是两套 block：
+    /// - `text_delta` 直接发 UI；
+    /// - `input_json_delta` 按 block index 累积，等 `message_stop` 后整体解析。
+    async fn chat_stream(
+        &self,
+        ctx: &CallContext<'_>,
+        req: &ChatRequest<'_>,
+        on_delta: &mut (dyn FnMut(String) + Send),
+    ) -> Result<ChatResponse> {
+        let body = build_body(ctx.model, req, true);
+        let response = send_with_retry(ctx.max_retries, || {
+            ctx.http
+                .post(messages_url(ctx.base_url))
+                .header("x-api-key", ctx.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&body)
+        })
+        .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(api_error(status, body));
+        }
+
+        // 代理/兼容端点可能忽略 stream=true，返回普通 JSON。
+        if !is_event_stream(&response) {
+            let raw = response.text().await?;
+            let parsed: AnthropicResponse = parse_response("anthropic", &raw)?;
+            return Ok(into_chat_response(parsed, ctx.model));
+        }
+
+        let mut model = None;
+        let mut input_tokens = None;
+        let mut output_tokens = None;
+        let mut stop_reason = None;
+        let mut blocks: BTreeMap<usize, StreamBlock> = BTreeMap::new();
+        let mut done = false;
+
+        consume_sse(response, |event| {
+            if done || event.data.is_empty() {
+                return Ok(());
+            }
+
+            let parsed: AnthropicStreamEvent = parse_response("anthropic", &event.data)?;
+            match parsed {
+                AnthropicStreamEvent::MessageStart { message } => {
+                    if let Some(value) = message.model {
+                        if !value.is_empty() {
+                            model = Some(value);
+                        }
+                    }
+                    if let Some(usage) = message.usage {
+                        input_tokens = usage.input_tokens.or(input_tokens);
+                        output_tokens = usage.output_tokens.or(output_tokens);
+                    }
+                }
+                AnthropicStreamEvent::ContentBlockStart {
+                    index,
+                    content_block,
+                } => {
+                    let block = match content_block {
+                        AnthropicStreamBlock::Text { text } => {
+                            if !text.is_empty() {
+                                on_delta(text.clone());
+                            }
+                            StreamBlock::Text(text)
+                        }
+                        AnthropicStreamBlock::ToolUse { id, name, input } => StreamBlock::Tool {
+                            id,
+                            name,
+                            initial: input,
+                            partial: String::new(),
+                        },
+                        AnthropicStreamBlock::Unknown => StreamBlock::Unknown,
+                    };
+                    blocks.insert(index, block);
+                }
+                AnthropicStreamEvent::ContentBlockDelta { index, delta } => match delta {
+                    AnthropicStreamDelta::TextDelta { text } => {
+                        if !text.is_empty() {
+                            match blocks
+                                .entry(index)
+                                .or_insert_with(|| StreamBlock::Text(String::new()))
+                            {
+                                StreamBlock::Text(buffer) => buffer.push_str(&text),
+                                // 类型不一致说明服务端违反了事件顺序；保留最终文本
+                                // 比 panic 更安全，这里直接忽略这个分片。
+                                _ => return Ok(()),
+                            }
+                            on_delta(text);
+                        }
+                    }
+                    AnthropicStreamDelta::InputJsonDelta { partial_json } => {
+                        if let Some(StreamBlock::Tool { partial, .. }) = blocks.get_mut(&index) {
+                            partial.push_str(&partial_json);
+                        }
+                    }
+                    AnthropicStreamDelta::Unknown => {}
+                },
+                AnthropicStreamEvent::ContentBlockStop => {}
+                AnthropicStreamEvent::MessageDelta { delta, usage } => {
+                    if let Some(reason) = delta.stop_reason {
+                        stop_reason = Some(reason);
+                    }
+                    if let Some(usage) = usage {
+                        input_tokens = usage.input_tokens.or(input_tokens);
+                        output_tokens = usage.output_tokens.or(output_tokens);
+                    }
+                }
+                AnthropicStreamEvent::MessageStop => {
+                    done = true;
+                }
+                AnthropicStreamEvent::Ping | AnthropicStreamEvent::Unknown => {}
+                AnthropicStreamEvent::Error { error } => {
+                    return Err(Error::Other(format!("Anthropic 流错误: {}", error.message)));
+                }
+            }
+            Ok(())
+        })
+        .await?;
+
         let mut text = String::new();
         let mut tool_calls = Vec::new();
-        for block in parsed.content {
+        for block in blocks.into_values() {
             match block {
-                AnthropicRespBlock::Text { text: value } => text.push_str(&value),
-                AnthropicRespBlock::ToolUse { id, name, input } => {
+                StreamBlock::Text(buffer) => text.push_str(&buffer),
+                StreamBlock::Tool {
+                    id,
+                    name,
+                    initial,
+                    partial,
+                } => {
+                    let arguments = if partial.trim().is_empty() {
+                        if initial.is_null() {
+                            serde_json::json!({})
+                        } else {
+                            initial
+                        }
+                    } else {
+                        parse_stream_arguments(&name, &partial)?
+                    };
                     tool_calls.push(ToolCall {
                         id,
                         name,
-                        arguments: input,
+                        arguments,
                     });
                 }
-                // 未知 block 丢弃。见文件头说明：extended thinking 需要原样回放。
-                AnthropicRespBlock::Unknown => {}
+                StreamBlock::Unknown => {}
             }
         }
+
+        let usage = match (input_tokens, output_tokens) {
+            (Some(input), Some(output)) => Some(Usage {
+                prompt_tokens: input,
+                completion_tokens: output,
+                total_tokens: input + output,
+            }),
+            (Some(input), None) => Some(Usage {
+                prompt_tokens: input,
+                completion_tokens: 0,
+                total_tokens: input,
+            }),
+            _ => None,
+        };
 
         Ok(ChatResponse {
             content: if text.is_empty() { None } else { Some(text) },
             tool_calls,
-            model: parsed.model,
-            // Anthropic 没有 total_tokens，自己加；缓存读写字段目前未纳入 Usage。
-            usage: parsed.usage.map(|usage| Usage {
-                prompt_tokens: usage.input_tokens,
-                completion_tokens: usage.output_tokens,
-                total_tokens: usage.input_tokens + usage.output_tokens,
-            }),
-            finish_reason: parsed
-                .stop_reason
-                .as_deref()
-                .map(FinishReason::from_anthropic),
+            model: model.unwrap_or_else(|| ctx.model.to_string()),
+            usage,
+            finish_reason: stop_reason.as_deref().map(FinishReason::from_anthropic),
         })
     }
+}
+
+/// 普通响应 JSON → 统一 `ChatResponse`。非流式和“服务端忽略 stream”的回退共用。
+fn into_chat_response(parsed: AnthropicResponse, fallback_model: &str) -> ChatResponse {
+    let AnthropicResponse {
+        model,
+        content,
+        stop_reason,
+        usage,
+    } = parsed;
+
+    // content 是 block 数组：text 可能有多段，tool_use 可以有多个。
+    // 纯文本拼接成一条 assistant content；工具调用单独收集。
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for block in content {
+        match block {
+            AnthropicRespBlock::Text { text: value } => text.push_str(&value),
+            AnthropicRespBlock::ToolUse { id, name, input } => {
+                tool_calls.push(ToolCall {
+                    id,
+                    name,
+                    arguments: input,
+                });
+            }
+            // 未知 block 丢弃。见文件头说明：extended thinking 需要原样回放。
+            AnthropicRespBlock::Unknown => {}
+        }
+    }
+
+    ChatResponse {
+        content: if text.is_empty() { None } else { Some(text) },
+        tool_calls,
+        model: if model.is_empty() {
+            fallback_model.to_string()
+        } else {
+            model
+        },
+        // Anthropic 没有 total_tokens，自己加；缓存读写字段目前未纳入 Usage。
+        usage: usage.map(|usage| Usage {
+            prompt_tokens: usage.input_tokens,
+            completion_tokens: usage.output_tokens,
+            total_tokens: usage.input_tokens + usage.output_tokens,
+        }),
+        finish_reason: stop_reason.as_deref().map(FinishReason::from_anthropic),
+    }
+}
+
+/// 构造请求体。非流式不发送 `stream` 字段，避免兼容代理对多余字段敏感。
+fn build_body<'a>(model: &'a str, req: &'a ChatRequest<'a>, stream: bool) -> AnthropicRequest<'a> {
+    AnthropicRequest {
+        model,
+        // 语义层允许多条 system，Anthropic 只接受一个顶层字符串。
+        system: system_prompt(req.messages),
+        messages: to_anthropic_messages(req.messages),
+        tools: if req.tools.is_empty() {
+            None
+        } else {
+            Some(
+                req.tools
+                    .iter()
+                    .map(|tool| AnthropicTool {
+                        name: &tool.name,
+                        description: &tool.description,
+                        input_schema: &tool.input_schema,
+                    })
+                    .collect(),
+            )
+        },
+        temperature: req.temperature,
+        // 必填。1024 对带工具/长解释的回复太小，容易在不知情的情况下截断；
+        // 需要更严格的上限时由调用方显式传 max_tokens。
+        max_tokens: req.max_tokens.unwrap_or(4096),
+        stream: stream.then_some(true),
+    }
+}
+
+/// 解析累积后的工具参数 JSON。错误里保留片段，和 OpenAI 适配器保持一致。
+fn parse_stream_arguments(tool: &str, raw: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(raw).map_err(|source| Error::InvalidToolArguments {
+        tool: tool.to_string(),
+        raw: truncate(raw, 256),
+        source,
+    })
 }
 
 /// 接受带或不带 `/v1` 的 base_url。
@@ -224,6 +432,9 @@ struct AnthropicRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     max_tokens: u32,
+    /// 非流式请求省略；流式时显式传 true。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 /// 工具声明。Anthropic 直接使用 `{name, description, input_schema}`，
@@ -301,6 +512,109 @@ enum AnthropicRespBlock {
 struct AnthropicUsage {
     input_tokens: u32,
     output_tokens: u32,
+}
+
+/// 流式 content block 的累积状态。
+enum StreamBlock {
+    Text(String),
+    Tool {
+        id: String,
+        name: String,
+        /// `content_block_start` 里通常是一个空对象，作为没有分片时的兜底。
+        initial: serde_json::Value,
+        /// `input_json_delta.partial_json` 的拼接结果。
+        partial: String,
+    },
+    Unknown,
+}
+
+/// Anthropic SSE 事件。`event:` 字段和 JSON 里的 `type` 一致，这里只信 JSON，
+/// 避免把心跳/未知事件误判。
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicStreamEvent {
+    MessageStart {
+        message: AnthropicStreamMessage,
+    },
+    ContentBlockStart {
+        index: usize,
+        content_block: AnthropicStreamBlock,
+    },
+    ContentBlockDelta {
+        index: usize,
+        delta: AnthropicStreamDelta,
+    },
+    ContentBlockStop,
+    MessageDelta {
+        #[serde(default)]
+        delta: AnthropicStreamMessageDelta,
+        #[serde(default)]
+        usage: Option<AnthropicStreamUsage>,
+    },
+    MessageStop,
+    Ping,
+    Error {
+        error: AnthropicStreamError,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize)]
+struct AnthropicStreamMessage {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    usage: Option<AnthropicStreamUsage>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicStreamBlock {
+    Text {
+        #[serde(default)]
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: serde_json::Value,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicStreamDelta {
+    TextDelta {
+        text: String,
+    },
+    InputJsonDelta {
+        partial_json: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct AnthropicStreamMessageDelta {
+    stop_reason: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct AnthropicStreamUsage {
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicStreamError {
+    #[serde(default)]
+    message: String,
 }
 
 #[cfg(test)]

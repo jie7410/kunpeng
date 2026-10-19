@@ -67,17 +67,31 @@ impl Provider {
         self
     }
 
+    pub(crate) async fn chat(&self, model: &str, req: &ChatRequest<'_>) -> Result<ChatResponse> {
+        let ctx = self.context(model);
+        self.protocol.chat(&ctx, req).await
+    }
+
+    pub(crate) async fn chat_stream(
+        &self,
+        model: &str,
+        req: &ChatRequest<'_>,
+        on_delta: &mut (dyn FnMut(String) + Send),
+    ) -> Result<ChatResponse> {
+        let ctx = self.context(model);
+        self.protocol.chat_stream(&ctx, req, on_delta).await
+    }
+
     /// 构造借用上下文。base_url/api_key 只读，不复制；model 由调用方传入，
     /// 因为同一个 Provider 可以被多个 Model 共用。
-    pub(crate) async fn chat(&self, model: &str, req: &ChatRequest<'_>) -> Result<ChatResponse> {
-        let ctx = CallContext {
+    fn context<'a>(&'a self, model: &'a str) -> CallContext<'a> {
+        CallContext {
             http: &self.http,
             base_url: &self.base_url,
             api_key: &self.api_key,
             model,
             max_retries: self.max_retries,
-        };
-        self.protocol.chat(&ctx, req).await
+        }
     }
 }
 

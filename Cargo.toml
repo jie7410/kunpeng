@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# 运行时：事件/取消用 sync，工具超时与重试退避用 time。
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# sync → 事件/取消；time → 工具超时/重试退避；io-std → CLI 异步读取 stdin。
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std"] }
 
 # 纯 rustls，避免依赖系统 OpenSSL，便于跨平台分发。
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

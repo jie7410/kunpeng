@@ -6,7 +6,8 @@
 
 - 有状态 `Agent`：持有会话历史，支持 `send`、`resume`、历史导入/导出
 - 工具调用循环：工具注册、schema 声明、执行超时、审批、错误回传
-- 事件流：assistant 回复、工具开始/结束、最终停止原因、错误
+- 事件流：assistant 增量/完整回复、工具开始/结束、最终停止原因、错误
+- 流式输出：OpenAI / Anthropic SSE 文本增量，工具参数分片自动累积
 - 取消令牌：中止进行中的模型请求，并保持历史可回放
 - 协议适配：OpenAI Chat Completions / Anthropic Messages
 - 重试：408/429/5xx 指数退避，尊重 `Retry-After`
@@ -56,9 +57,27 @@ export LLM_API_KEY=sk-...
 cargo run
 ```
 
-`src/main.rs` 会注册一个示例天气工具，向模型提问后打印事件和最终回复。
+`cargo run` 会进入交互式 CLI。直接输入问题，流式输出会边生成边打印，结束后显示停止原因。
 
-运行独立示例（同样是 echo 工具）：
+| 命令 | 作用 |
+|---|---|
+| `/help` | 显示帮助 |
+| `/clear` | 清空历史，保留 system prompt |
+| `/retry` | 重试当前历史（用于上一次请求失败） |
+| `/exit` / `/quit` | 退出 |
+
+例如：
+
+```text
+you> 北京今天天气如何？
+tool started: get_weather {"city":"北京"}
+tool finished: get_weather Success { content: "北京 今天晴..." }
+北京晴
+[stop: Completed]
+you> /exit
+```
+
+运行独立示例（同样是 echo 工具，非交互）：
 
 ```bash
 cargo run --example basic_agent
@@ -227,16 +246,26 @@ let hooks = AgentHooks {
 `AgentEvent` 顺序：
 
 ```text
-Assistant → (ToolStarted → ToolFinished)* → Finished
+AssistantDelta* → Assistant → (ToolStarted → ToolFinished)* → Finished
 ```
 
 | 事件 | 时机 |
 |---|---|
-| `Assistant` | 单次模型回复已写入历史 |
+| `AssistantDelta` | 流式文本分片；临时内容，不能当最终消息 |
+| `Assistant` | 单次模型回复已写入历史，`content` 是完整文本 |
 | `ToolStarted` | 审批通过、工具即将执行 |
 | `ToolFinished` | 工具成功、失败或被拒绝 |
 | `Finished` | 正常结束，带 `StopReason` |
 | `Error` | 模型请求失败；历史保留，可 `resume()` |
+
+`AgentConfig::stream` 默认 `true`。取消或流式解析失败时，UI 应丢弃当前增量缓冲；以最终的 `Assistant` 或 `Error` 为准。兼容端点不支持 SSE 时：
+
+```rust
+let config = AgentConfig {
+    stream: false,
+    ..AgentConfig::default()
+};
+```
 
 `StopReason`：
 
@@ -287,7 +316,7 @@ docs/
 └── ARCHITECTURE.md        分层、调用链与设计取舍
 src/
 ├── lib.rs                 library 入口
-├── main.rs                CLI 示例
+├── main.rs                交互式 CLI
 └── llm/
     ├── types.rs           协议无关的语义类型
     ├── error.rs           错误分类
@@ -296,7 +325,7 @@ src/
     ├── tool.rs            Tool trait 与 ToolRegistry
     ├── agent.rs           历史、工具循环、事件、审批、取消、超时
     └── provider/
-        ├── protocol.rs    Protocol trait、重试、解析、截断
+        ├── protocol.rs    Protocol trait、SSE 解码、重试、解析、截断
         ├── openai.rs      OpenAI 兼容适配器
         └── anthropic.rs   Anthropic 适配器
 examples/
@@ -319,7 +348,8 @@ cargo doc --no-deps --open
 当前测试覆盖：
 
 - 两个协议适配器的消息转换与 usage/finish_reason 映射
-- Agent 循环、工具拒绝、工具超时、取消、达到轮数
+- SSE 解码：跨 chunk、CRLF、多行 data、UTF-8 字符拆分
+- Agent 流式增量事件、工具拒绝、工具超时、取消、达到轮数
 - 配置默认值、API key 脱敏、工具注册校验
 - `Message` serde 往返
 
@@ -327,7 +357,6 @@ cargo doc --no-deps --open
 
 ## 已知限制
 
-- 流式输出尚未实现，当前只有非流式请求
 - Anthropic 的 `thinking`、服务端工具等未知 block 会被忽略；启用 extended thinking 前需要保存原始 block
 - 没有上下文窗口裁剪，长会话可能超过模型上限
 - 工具审批是同步回调，暂不支持异步 UI 确认

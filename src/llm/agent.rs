@@ -36,6 +36,11 @@ pub struct AgentConfig {
     /// 覆盖 `ModelDefault` 的值；None 表示沿用模型默认。
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// 是否使用流式请求。
+    ///
+    /// 默认开启：文本增量通过 `AgentEvent::AssistantDelta` 发出，UI 可以做打字机
+    /// 效果。兼容端点不支持 SSE 时改成 false，Agent 会走普通 `chat`。
+    pub stream: bool,
     /// 单个工具的硬超时；None 表示不限制。
     ///
     /// 工具可能跑 shell、读大文件或等外部服务，不能指望它自己守时。超时只终止
@@ -49,6 +54,7 @@ impl Default for AgentConfig {
             max_turns: 8,
             temperature: None,
             max_tokens: None,
+            stream: true,
             tool_timeout: Some(Duration::from_secs(60)),
         }
     }
@@ -105,14 +111,20 @@ pub struct ToolExecution {
 /// 事件是拥有所有权的普通数据：CLI 可以直接打印，Tauri 可以序列化后 emit，
 /// 测试可以收集到 Vec 里断言。事件顺序固定为：
 ///
-/// `Assistant` → (`ToolStarted` → `ToolFinished`)* → `Finished`
+/// `AssistantDelta* → Assistant → (ToolStarted → ToolFinished)* → Finished`
 ///
-/// 失败时由 `Error` 事件替代 `Finished`；`ToolStarted` 只在审批通过后发出，
-/// 被拒绝的调用只有 `ToolFinished(Denied)`。
+/// `AssistantDelta` 是临时内容，只用于展示；最终以 `Assistant` 里的完整
+/// `content` 为准。失败时由 `Error` 事件替代 `Finished`；`ToolStarted` 只在
+/// 审批通过后发出，被拒绝的调用只有 `ToolFinished(Denied)`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AgentEvent {
+    /// 流式文本增量。可能被取消/失败打断，UI 收到 Error 或 Cancelled 后应丢弃
+    /// 当前流式缓冲。
+    AssistantDelta {
+        text: String,
+    },
     /// 单次模型响应。此时 assistant 消息已经写入 history。
     Assistant {
         content: Option<String>,
@@ -332,6 +344,7 @@ impl Agent {
                     max_tokens: self.config.max_tokens,
                 };
                 let cancel = self.cancel.clone();
+                let stream = self.config.stream;
                 // biased + 取消分支在前：多个分支同时就绪时优先响应取消，
                 // 避免刚好返回的响应让用户觉得“点了取消还在继续”。
                 tokio::select! {
@@ -345,7 +358,16 @@ impl Agent {
                         );
                         return Ok(StopReason::Cancelled);
                     }
-                    result = self.model.chat(&request) => match result {
+                    result = async {
+                        if stream {
+                            let mut on_delta = |text: String| {
+                                emit(hooks, AgentEvent::AssistantDelta { text });
+                            };
+                            self.model.chat_stream(&request, &mut on_delta).await
+                        } else {
+                            self.model.chat(&request).await
+                        }
+                    } => match result {
                         Ok(response) => response,
                         Err(error) => {
                             // 历史保持原样（末尾是 user 或上一轮 tool_result），
@@ -769,6 +791,80 @@ mod tests {
         assert_eq!(stop, StopReason::MaxTurns);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(matches!(agent.history().last(), Some(Message::Tool { .. })));
+    }
+
+    struct StreamingProtocol;
+
+    #[async_trait]
+    impl Protocol for StreamingProtocol {
+        async fn chat(
+            &self,
+            _ctx: &CallContext<'_>,
+            _req: &ChatRequest<'_>,
+        ) -> Result<ChatResponse> {
+            Err(Error::Other(
+                "chat() should not be used when stream=true".into(),
+            ))
+        }
+
+        async fn chat_stream(
+            &self,
+            _ctx: &CallContext<'_>,
+            _req: &ChatRequest<'_>,
+            on_delta: &mut (dyn FnMut(String) + Send),
+        ) -> Result<ChatResponse> {
+            on_delta("你".into());
+            on_delta("好".into());
+            Ok(ChatResponse {
+                content: Some("你好".into()),
+                tool_calls: vec![],
+                model: "mock".into(),
+                usage: None,
+                finish_reason: Some(FinishReason::Stop),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_emits_deltas_before_final_assistant() {
+        let provider = Arc::new(
+            Provider::new(
+                "https://example.invalid",
+                "key",
+                Arc::new(StreamingProtocol),
+                5,
+            )
+            .unwrap(),
+        );
+        let model = Model::new(provider, "mock");
+        let mut agent = Agent::new(model, ToolRegistry::new(), AgentConfig::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let on_event = {
+            let events = Arc::clone(&events);
+            move |event: AgentEvent| events.lock().unwrap().push(event)
+        };
+        let hooks = AgentHooks {
+            on_event: Some(&on_event),
+            approve: None,
+        };
+
+        let stop = agent.send(Message::user("hi"), &hooks).await.unwrap();
+
+        assert_eq!(stop, StopReason::Completed);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(&events[0], AgentEvent::AssistantDelta { text } if text == "你"));
+        assert!(matches!(&events[1], AgentEvent::AssistantDelta { text } if text == "好"));
+        assert!(matches!(
+            &events[2],
+            AgentEvent::Assistant { content: Some(text), .. } if text == "你好"
+        ));
+        assert!(matches!(
+            &events[3],
+            AgentEvent::Finished {
+                stop_reason: StopReason::Completed
+            }
+        ));
     }
 
     struct SlowProtocol {

@@ -63,6 +63,20 @@ impl Model {
         };
         self.provider.chat(&self.name, &req).await
     }
+
+    /// 流式调用。默认参数补齐逻辑与非流式一致；文本增量通过回调交给 Agent/UI。
+    pub async fn chat_stream(
+        &self,
+        req: &ChatRequest<'_>,
+        on_delta: &mut (dyn FnMut(String) + Send),
+    ) -> Result<ChatResponse> {
+        let req = ChatRequest {
+            temperature: req.temperature.or(self.defaults.temperature),
+            max_tokens: req.max_tokens.or(self.defaults.max_tokens),
+            ..*req
+        };
+        self.provider.chat_stream(&self.name, &req, on_delta).await
+    }
 }
 
 #[cfg(test)]
