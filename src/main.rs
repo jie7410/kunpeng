@@ -10,8 +10,8 @@
 
 use async_trait::async_trait;
 use kunpeng::llm::{
-    Agent, AgentConfig, AgentEvent, AgentHooks, LlmConfig, Message, Result, Tool, ToolDefinition,
-    ToolRegistry,
+    Agent, AgentConfig, AgentEvent, AgentHooks, LlmConfig, Message, Result, ThinkingConfig, Tool,
+    ToolDefinition, ToolRegistry,
 };
 use std::{
     io::{self, Write},
@@ -72,27 +72,86 @@ async fn main() -> Result<()> {
     tools.register(GetWeatherTool)?;
 
     let system = Message::system(SYSTEM_PROMPT);
-    let mut agent = Agent::with_history(model, tools, AgentConfig::default(), vec![system.clone()]);
+    let thinking = match std::env::var("LLM_THINKING_BUDGET") {
+        Ok(value) => {
+            let budget_tokens = value.trim().parse::<u32>().map_err(|error| {
+                kunpeng::llm::Error::InvalidConfig(format!(
+                    "LLM_THINKING_BUDGET 不是合法整数: {error}"
+                ))
+            })?;
+            Some(ThinkingConfig { budget_tokens })
+        }
+        Err(_) => None,
+    };
+    let agent_config = AgentConfig {
+        thinking,
+        server_tools: match std::env::var("LLM_SERVER_TOOLS") {
+            Ok(value) if !value.trim().is_empty() => {
+                serde_json::from_str::<Vec<serde_json::Value>>(value.trim()).map_err(|error| {
+                    kunpeng::llm::Error::InvalidConfig(format!(
+                        "LLM_SERVER_TOOLS 不是合法 JSON 数组: {error}"
+                    ))
+                })?
+            }
+            _ => Vec::new(),
+        },
+        ..AgentConfig::default()
+    };
+    let mut agent = Agent::with_history(model, tools, agent_config, vec![system.clone()]);
 
     // 一次 assistant 回复可能包含多个增量。打印完增量后，用最终 Assistant 事件
     // 补一个换行；如果关闭流式，则在这里打印完整内容。
     let saw_delta = Arc::new(AtomicBool::new(false));
+    let saw_thinking = Arc::new(AtomicBool::new(false));
+    let thinking_emitted = Arc::new(AtomicBool::new(false));
     let on_event = {
         let saw_delta = Arc::clone(&saw_delta);
+        let saw_thinking = Arc::clone(&saw_thinking);
+        let thinking_emitted = Arc::clone(&thinking_emitted);
         move |event: AgentEvent| match event {
             AgentEvent::AssistantDelta { text } => {
+                // thinking 先于正文到达；第一段正文前结束 thinking 行。
+                if saw_thinking.swap(false, Ordering::Relaxed) {
+                    println!();
+                }
                 print!("{text}");
                 let _ = io::stdout().flush();
                 saw_delta.store(true, Ordering::Relaxed);
             }
+            AgentEvent::ThinkingDelta { text } => {
+                if !saw_thinking.swap(true, Ordering::Relaxed) {
+                    print!("[thinking] ");
+                }
+                thinking_emitted.store(true, Ordering::Relaxed);
+                print!("{text}");
+                let _ = io::stdout().flush();
+            }
             AgentEvent::Assistant {
-                content: Some(content),
+                content,
+                thinking,
+                citations,
+                server_tool_uses,
                 ..
             } => {
+                if saw_thinking.swap(false, Ordering::Relaxed) {
+                    println!();
+                } else if !thinking_emitted.swap(false, Ordering::Relaxed) {
+                    if let Some(thinking) = thinking {
+                        // 非流式（stream=false）时没有 ThinkingDelta，在这里补显示。
+                        println!("[thinking] {thinking}");
+                    }
+                }
+                thinking_emitted.store(false, Ordering::Relaxed);
                 if saw_delta.swap(false, Ordering::Relaxed) {
                     println!();
-                } else {
+                } else if let Some(content) = content {
                     println!("assistant: {content}");
+                }
+                for tool in &server_tool_uses {
+                    println!("[server tool] {} {}", tool.name, tool.input);
+                }
+                if !citations.is_empty() {
+                    println!("[citations] {}", citations.len());
                 }
             }
             AgentEvent::ToolStarted { call } => {
@@ -102,9 +161,12 @@ async fn main() -> Result<()> {
                 println!("tool finished: {} {:?}", execution.name, execution.outcome);
             }
             AgentEvent::Error { message } => {
-                if saw_delta.swap(false, Ordering::Relaxed) {
+                if saw_thinking.swap(false, Ordering::Relaxed)
+                    || saw_delta.swap(false, Ordering::Relaxed)
+                {
                     println!();
                 }
+                thinking_emitted.store(false, Ordering::Relaxed);
                 eprintln!("error: {message}");
             }
             // Finished 的 stop_reason 由 send/resume 的返回值统一打印。
@@ -119,6 +181,7 @@ async fn main() -> Result<()> {
 
     println!("Kunpeng interactive CLI");
     println!("{HELP}");
+    println!("可选环境变量: LLM_THINKING_BUDGET, LLM_SERVER_TOOLS");
     println!();
 
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());

@@ -9,7 +9,7 @@ pub mod protocol;
 
 use crate::llm::error::{Error, Result};
 use crate::llm::provider::protocol::{CallContext, Protocol};
-use crate::llm::types::{ChatRequest, ChatResponse};
+use crate::llm::types::{ChatRequest, ChatResponse, StreamDelta};
 use std::{sync::Arc, time::Duration};
 
 pub struct Provider {
@@ -76,7 +76,7 @@ impl Provider {
         &self,
         model: &str,
         req: &ChatRequest<'_>,
-        on_delta: &mut (dyn FnMut(String) + Send),
+        on_delta: &mut (dyn FnMut(StreamDelta) + Send),
     ) -> Result<ChatResponse> {
         let ctx = self.context(model);
         self.protocol.chat_stream(&ctx, req, on_delta).await

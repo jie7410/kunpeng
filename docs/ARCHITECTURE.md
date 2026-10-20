@@ -114,8 +114,8 @@ sequenceDiagram
         AD->>API: POST /chat/completions 或 /v1/messages（stream=true）
         loop SSE chunks
             API-->>AD: data / event
-            AD-->>A: on_delta(text)
-            A-->>UI: AgentEvent::AssistantDelta
+            AD-->>A: on_delta(Text / Thinking)
+            A-->>UI: AgentEvent::AssistantDelta / ThinkingDelta
         end
         AD-->>P: ChatResponse（统一类型）
         P-->>M: ChatResponse
@@ -153,6 +153,10 @@ sequenceDiagram
 | `ChatResponse` | 一次模型回复 | 统一 content、tool_calls、usage、finish_reason |
 | `ToolDefinition` | 工具 schema | 发给模型声明可用工具 |
 | `ToolCall` | 模型发起的一次工具调用 | 带 id，工具结果需要按 id 回传 |
+| `ThinkingConfig` | 扩展思考预算 | Anthropic `budget_tokens` |
+| `ProviderData` | provider 原始 block | thinking/signature 和未知 block 原样回放 |
+| `ServerToolUse` | 服务端工具只读投影 | 展示 `server_tool_use`，不参与本地执行 |
+| `StreamDelta` | 流式增量 | 区分正文与思考内容 |
 | `AgentEvent` | 过程中的事件 | UI 渲染进度、工具状态、错误 |
 | `StopReason` | 整个循环为什么停止 | 区分正常完成、超长、达到轮数、取消 |
 | `FinishReason` | 单次模型响应为什么结束 | 统一 OpenAI/Anthropic 的不同字符串 |
@@ -236,10 +240,10 @@ Deny(reason) → 不执行，写入 is_error 的 tool_result
 `AgentEvent` 是普通可序列化数据：
 
 ```text
-AssistantDelta* → Assistant → (ToolStarted → ToolFinished)* → Finished
+AssistantDelta* / ThinkingDelta* → Assistant → (ToolStarted → ToolFinished)* → Finished
 ```
 
-`AssistantDelta` 只是展示用的临时文本；最终内容以 `Assistant` 为准。失败或取消时，UI 应丢弃增量缓冲。失败时由 `Error` 事件替代 `Finished`。
+`AssistantDelta`/`ThinkingDelta` 只是展示用的临时内容；最终内容以 `Assistant` 为准。失败或取消时，UI 应丢弃增量缓冲。失败时由 `Error` 事件替代 `Finished`。
 
 Tauri 可以直接把事件 `emit` 给前端；CLI 直接打印；测试收集到 `Vec` 里断言。内核不依赖任何 UI 类型。
 
@@ -249,7 +253,7 @@ Tauri 可以直接把事件 `emit` 给前端；CLI 直接打印；测试收集�
 - 工具执行期间不中途取消，只在工具之间检查，避免留下子进程；
 - 单个工具的硬上限由 `AgentConfig::tool_timeout` 控制。
 
-### 9. 流式在协议层收敛，Agent 只消费文本增量
+### 9. 流式在协议层收敛，Agent 只消费增量事件
 
 `Protocol::chat_stream` 的默认实现退回 `chat`，把完整文本作为单个增量发出。新增 provider 可以先只实现非流式，Agent 不需要判断对方是否支持 SSE。
 
@@ -257,10 +261,34 @@ Tauri 可以直接把事件 `emit` 给前端；CLI 直接打印；测试收集�
 
 - 共用 `SseDecoder`：跨 chunk 缓冲、按行解析、处理 CRLF/多行 `data:`；
 - OpenAI：按 `tool_calls[].index` 累积 id/name/arguments 分片，`[DONE]` 结束；
-- Anthropic：文本走 `text_delta`，工具参数走 `input_json_delta`，按 content block index 累积；
+- Anthropic：文本走 `text_delta`，思考走 `thinking_delta`/`signature_delta`，工具参数走 `input_json_delta`，按 content block index 累积；
 - 最终都组装成同一个 `ChatResponse`，Agent 的工具循环与非流式完全一致。
 
 `AgentConfig::stream` 默认开启。不支持 SSE 的兼容端点设为 `false`；流式请求的 usage 取决于服务端是否主动发送。
+
+### 10. Thinking 和未知 block 用原始 JSON 回放
+
+Anthropic 的 thinking block 带 `signature`，下一轮必须原样带回；`redacted_thinking`、`server_tool_use`、`web_search_tool_result` 等 block 也有同样的结构要求。语义层不可能为每种 block 建类型，所以：
+
+- `ChatResponse.provider_data` / `Message::Assistant.provider_data` 保存完整 content 数组；
+- 下一轮 `to_anthropic_messages` 发现 provider 是 Anthropic 时，直接使用原始数组，不按 text/tool_calls 重建；
+- `thinking` 字段只保存拼接后的可读文本，供 UI 展示；
+- 流式路径把 `thinking_delta` 累积成文本、`signature_delta` 追加到签名，未知 block 保留 start JSON，`input_json_delta` 合并进 `input`。
+
+这样 block 顺序、签名和未知字段都不会丢。代价是 `provider_data` 不能手改；它属于 provider 的不透明数据。
+
+### 11. 服务端工具走独立通道，citations 只做投影
+
+服务端工具由 Anthropic 执行，客户端不能把它当成本地 `ToolCall`：
+
+- `AgentConfig.server_tools` 保存服务端工具定义，Anthropic 适配器把本地函数工具和服务端工具合并进 `tools` 数组；
+- `server_tool_use` 不进入 `tool_calls`，只投影到 `ChatResponse.server_tool_uses` / `AgentEvent::Assistant.server_tool_uses`；
+- `server_tool_use` / `*_tool_result` 仍在 `provider_data` 中，下一轮原样回放；
+- `pause_turn` 映射为 `FinishReason::Pause`，Agent 不追加用户消息，直接进入下一轮；
+- citations 结构差异大，先以原始 JSON 放进 `ChatResponse.citations` / `Message::Assistant.citations`；
+- 流式 `citations_delta` 累积到 text block，最终同时写入语义字段和原始 block。
+
+不要把服务端工具注册进 `ToolRegistry`，也不要让它走本地审批/超时逻辑。
 
 ---
 
@@ -272,6 +300,7 @@ Tauri 可以直接把事件 `emit` 给前端；CLI 直接打印；测试收集�
 | 模型调用工具 | 执行后进入下一轮模型请求 | 末尾是 tool_result |
 | 达到 `max_turns` | `StopReason::MaxTurns` | 末尾可能是 tool_result，可 `resume()` |
 | 模型因 token 上限停止 | `StopReason::Length` | 末尾是 assistant，正文可能被截断 |
+| 服务端工具 `pause_turn` | 自动继续请求 | 末尾是带原始 block 的 assistant |
 | 内容被安全策略过滤 | `StopReason::ContentFilter` | 末尾是 assistant |
 | 模型请求失败 | 返回 `Err`，发 `Error` 事件 | 不追加消息，可 `resume()` |
 | 流式中途失败/取消 | 返回 `Err` / `StopReason::Cancelled` | 不追加 assistant；UI 丢弃增量缓冲 |
@@ -327,6 +356,7 @@ Tauri 可以直接把事件 `emit` 给前端；CLI 直接打印；测试收集�
 
 这些是已知的、有意保留的后续项：
 
-- Anthropic 的 `thinking`、服务端工具等未知 block 会被忽略，启用 extended thinking 前需要保存原始 block；
+- Anthropic 服务端工具由 Anthropic 执行，不会进入本地 `ToolCall`；只读投影到 `server_tool_uses`
+- Anthropic 的未知 delta（除 text/thinking/signature/input_json/citations 外）不进入语义字段，原始 block 仍会保留
 - 没有上下文窗口裁剪，长会话仍可能超过模型上限；
 - 工具审批是同步回调，Tauri 若需要真正异步等待用户确认，需要扩展成 async approver。

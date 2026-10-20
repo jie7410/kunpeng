@@ -13,7 +13,9 @@ use super::protocol::{
     CallContext, Protocol,
 };
 use crate::llm::error::{Error, Result};
-use crate::llm::types::{ChatRequest, ChatResponse, FinishReason, Message, ToolCall, Usage};
+use crate::llm::types::{
+    ChatRequest, ChatResponse, FinishReason, Message, StreamDelta, ToolCall, Usage,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, collections::BTreeMap};
@@ -23,6 +25,11 @@ pub struct OpenAiProtocol;
 #[async_trait]
 impl Protocol for OpenAiProtocol {
     async fn chat(&self, ctx: &CallContext<'_>, req: &ChatRequest<'_>) -> Result<ChatResponse> {
+        if !req.server_tools.is_empty() {
+            return Err(Error::InvalidConfig(
+                "server_tools 只支持 Anthropic 服务端工具".into(),
+            ));
+        }
         // 请求体只借用历史与工具定义：消息内容和 id 都不复制，只有工具参数
         // 因为协议要求字符串而重新序列化。
         let body = build_body(ctx.model, req, false);
@@ -57,8 +64,13 @@ impl Protocol for OpenAiProtocol {
         &self,
         ctx: &CallContext<'_>,
         req: &ChatRequest<'_>,
-        on_delta: &mut (dyn FnMut(String) + Send),
+        on_delta: &mut (dyn FnMut(StreamDelta) + Send),
     ) -> Result<ChatResponse> {
+        if !req.server_tools.is_empty() {
+            return Err(Error::InvalidConfig(
+                "server_tools 只支持 Anthropic 服务端工具".into(),
+            ));
+        }
         let body = build_body(ctx.model, req, true);
         let response = send_with_retry(ctx.max_retries, || {
             ctx.http
@@ -115,7 +127,7 @@ impl Protocol for OpenAiProtocol {
                 if let Some(text) = choice.delta.content {
                     if !text.is_empty() {
                         content.push_str(&text);
-                        on_delta(text);
+                        on_delta(StreamDelta::Text(text));
                     }
                 }
 
@@ -159,6 +171,10 @@ impl Protocol for OpenAiProtocol {
             model: model.unwrap_or_else(|| ctx.model.to_string()),
             usage,
             finish_reason,
+            thinking: None,
+            citations: vec![],
+            server_tool_uses: vec![],
+            provider_data: None,
         })
     }
 }
@@ -208,6 +224,10 @@ fn into_chat_response(parsed: OpenAiResponse, fallback_model: &str) -> Result<Ch
             .finish_reason
             .as_deref()
             .map(FinishReason::from_openai),
+        thinking: None,
+        citations: vec![],
+        server_tool_uses: vec![],
+        provider_data: None,
     })
 }
 
@@ -279,6 +299,7 @@ fn to_openai_message(message: &Message) -> OpenAiMessage<'_> {
         Message::Assistant {
             content,
             tool_calls,
+            ..
         } => OpenAiMessage {
             role: "assistant",
             content: content.as_deref().map(Cow::Borrowed),
@@ -562,6 +583,10 @@ mod tests {
                 name: "echo".into(),
                 arguments: serde_json::json!({"text": "hi"}),
             }],
+            thinking: None,
+            citations: vec![],
+            server_tool_uses: vec![],
+            provider_data: None,
         };
         let value = serde_json::to_value(to_openai_message(&message)).unwrap();
         assert!(value["content"].is_null());

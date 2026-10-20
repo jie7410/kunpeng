@@ -8,6 +8,9 @@
 - 工具调用循环：工具注册、schema 声明、执行超时、审批、错误回传
 - 事件流：assistant 增量/完整回复、工具开始/结束、最终停止原因、错误
 - 流式输出：OpenAI / Anthropic SSE 文本增量，工具参数分片自动累积
+- 扩展思考：Anthropic thinking，流式 `thinking_delta`，原始 block 与签名原样回放
+- 服务端工具：Anthropic `server_tool_use` 原样回放，`pause_turn` 自动续跑
+- Citations：原始 citation 对象投影到 `Assistant.citations`，流式 `citations_delta` 累积
 - 取消令牌：中止进行中的模型请求，并保持历史可回放
 - 协议适配：OpenAI Chat Completions / Anthropic Messages
 - 重试：408/429/5xx 指数退避，尊重 `Retry-After`
@@ -246,13 +249,14 @@ let hooks = AgentHooks {
 `AgentEvent` 顺序：
 
 ```text
-AssistantDelta* → Assistant → (ToolStarted → ToolFinished)* → Finished
+AssistantDelta* / ThinkingDelta* → Assistant → (ToolStarted → ToolFinished)* → Finished
 ```
 
 | 事件 | 时机 |
 |---|---|
-| `AssistantDelta` | 流式文本分片；临时内容，不能当最终消息 |
-| `Assistant` | 单次模型回复已写入历史，`content` 是完整文本 |
+| `AssistantDelta` | 流式正文分片；临时内容，不能当最终消息 |
+| `ThinkingDelta` | 流式思考分片；只在 Anthropic 开启 thinking 时出现 |
+| `Assistant` | 单次模型回复已写入历史，包含 `content` / `thinking` / `citations` / `server_tool_uses` |
 | `ToolStarted` | 审批通过、工具即将执行 |
 | `ToolFinished` | 工具成功、失败或被拒绝 |
 | `Finished` | 正常结束，带 `StopReason` |
@@ -266,6 +270,68 @@ let config = AgentConfig {
     ..AgentConfig::default()
 };
 ```
+
+### Extended thinking
+
+当前仅 Anthropic 支持。CLI 可以直接用环境变量开启：
+
+```powershell
+$env:LLM_THINKING_BUDGET = "2048"
+cargo run
+```
+
+library 用法：
+
+```rust
+use kunpeng::llm::{AgentConfig, ThinkingConfig};
+
+let config = AgentConfig {
+    thinking: Some(ThinkingConfig {
+        budget_tokens: 2048,
+    }),
+    ..AgentConfig::default()
+};
+```
+
+约束：
+
+- `budget_tokens` 最小 1024，且必须小于 `max_tokens`
+- 开启 thinking 时 `temperature` 必须为 1 或不设置
+- thinking 文本通过 `ThinkingDelta` / `Assistant.thinking` 展示
+- `Message::Assistant.provider_data` 保存原始 thinking/signature 和未知 block，下一轮自动原样回放；不要手动修改它
+
+### Server tools 与 citations
+
+服务端工具由 Anthropic 执行，不会进入本地 `ToolCall` 或 `ToolRegistry`。CLI 可以通过 JSON 数组声明：
+
+```powershell
+$env:LLM_SERVER_TOOLS = '[{"type":"web_search_20250305","name":"web_search","max_uses":3}]'
+```
+
+library 用法：
+
+```rust
+use kunpeng::llm::AgentConfig;
+
+let config = AgentConfig {
+    server_tools: vec![serde_json::json!({
+        "type": "web_search_20250305",
+        "name": "web_search",
+        "max_uses": 3
+    })],
+    ..AgentConfig::default()
+};
+```
+
+行为：
+
+- 服务端工具调用通过 `Assistant.server_tool_uses` 只读展示；
+- `server_tool_use` / `*_tool_result` 保留在 `provider_data`，下一轮原样回放；
+- Anthropic 返回 `pause_turn` 时，Agent 自动继续请求，不要求用户再发消息；
+- 文本 block 的 citations 进入 `Assistant.citations`；流式 `citations_delta` 会同时补进原始 text block；
+- 服务端工具不会触发本地审批、超时或 `Tool::call`。
+
+注意：`server_tools` 只支持 Anthropic；OpenAI 适配器会返回配置错误。
 
 `StopReason`：
 
@@ -350,6 +416,9 @@ cargo doc --no-deps --open
 - 两个协议适配器的消息转换与 usage/finish_reason 映射
 - SSE 解码：跨 chunk、CRLF、多行 data、UTF-8 字符拆分
 - Agent 流式增量事件、工具拒绝、工具超时、取消、达到轮数
+- Anthropic thinking：请求参数、thinking 文本提取、原始 block/签名回放
+- 服务端工具：request 合并、只读投影、`pause_turn` 续跑
+- Citations：非流式提取、流式 `citations_delta` 累积
 - 配置默认值、API key 脱敏、工具注册校验
 - `Message` serde 往返
 
@@ -357,7 +426,8 @@ cargo doc --no-deps --open
 
 ## 已知限制
 
-- Anthropic 的 `thinking`、服务端工具等未知 block 会被忽略；启用 extended thinking 前需要保存原始 block
+- Anthropic 服务端工具由 Anthropic 执行，不会作为本地 `ToolCall` 执行；通过 `server_tool_uses` 只读展示
+- Anthropic 的未知 delta（除 text/thinking/signature/input_json/citations 外）不进入语义字段，原始 block 仍会保留
 - 没有上下文窗口裁剪，长会话可能超过模型上限
 - 工具审批是同步回调，暂不支持异步 UI 确认
 - 多模态消息和 `tool_choice`、`stop` 等扩展参数尚未暴露

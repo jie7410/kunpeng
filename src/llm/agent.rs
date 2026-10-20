@@ -13,7 +13,9 @@
 use crate::llm::error::{Error, Result};
 use crate::llm::model::Model;
 use crate::llm::tool::ToolRegistry;
-use crate::llm::types::{ChatRequest, FinishReason, Message, ToolCall};
+use crate::llm::types::{
+    ChatRequest, FinishReason, Message, ServerToolUse, StreamDelta, ThinkingConfig, ToolCall,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
@@ -41,6 +43,10 @@ pub struct AgentConfig {
     /// 默认开启：文本增量通过 `AgentEvent::AssistantDelta` 发出，UI 可以做打字机
     /// 效果。兼容端点不支持 SSE 时改成 false，Agent 会走普通 `chat`。
     pub stream: bool,
+    /// 扩展思考配置。当前只有 Anthropic 适配器使用；None 表示不开启。
+    pub thinking: Option<ThinkingConfig>,
+    /// Anthropic 服务端工具定义。只传给 API，不注册到本地 `ToolRegistry`。
+    pub server_tools: Vec<serde_json::Value>,
     /// 单个工具的硬超时；None 表示不限制。
     ///
     /// 工具可能跑 shell、读大文件或等外部服务，不能指望它自己守时。超时只终止
@@ -55,6 +61,8 @@ impl Default for AgentConfig {
             temperature: None,
             max_tokens: None,
             stream: true,
+            thinking: None,
+            server_tools: Vec::new(),
             tool_timeout: Some(Duration::from_secs(60)),
         }
     }
@@ -111,11 +119,11 @@ pub struct ToolExecution {
 /// 事件是拥有所有权的普通数据：CLI 可以直接打印，Tauri 可以序列化后 emit，
 /// 测试可以收集到 Vec 里断言。事件顺序固定为：
 ///
-/// `AssistantDelta* → Assistant → (ToolStarted → ToolFinished)* → Finished`
+/// `AssistantDelta* / ThinkingDelta* → Assistant → (ToolStarted → ToolFinished)* → Finished`
 ///
-/// `AssistantDelta` 是临时内容，只用于展示；最终以 `Assistant` 里的完整
-/// `content` 为准。失败时由 `Error` 事件替代 `Finished`；`ToolStarted` 只在
-/// 审批通过后发出，被拒绝的调用只有 `ToolFinished(Denied)`。
+/// `AssistantDelta`/`ThinkingDelta` 是临时内容，只用于展示；最终以 `Assistant`
+/// 里的完整 `content` / `thinking` 为准。失败时由 `Error` 事件替代 `Finished`；
+/// `ToolStarted` 只在审批通过后发出，被拒绝的调用只有 `ToolFinished(Denied)`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -125,12 +133,22 @@ pub enum AgentEvent {
     AssistantDelta {
         text: String,
     },
+    /// 流式思考增量。是否展示由 UI 决定，通常放在可折叠区域。
+    ThinkingDelta {
+        text: String,
+    },
     /// 单次模型响应。此时 assistant 消息已经写入 history。
     Assistant {
         content: Option<String>,
         tool_calls: Vec<ToolCall>,
         usage: Option<crate::llm::types::Usage>,
         finish_reason: Option<FinishReason>,
+        /// 合并后的 thinking 文本；是否展示由 UI 决定。
+        thinking: Option<String>,
+        /// 原始 citation 对象，供 UI 渲染脚注/引用。
+        citations: Vec<serde_json::Value>,
+        /// 服务端工具调用，只读展示，不会进入本地工具循环。
+        server_tool_uses: Vec<ServerToolUse>,
     },
     /// 工具即将执行。审批通过后才会发出。
     ToolStarted {
@@ -342,6 +360,8 @@ impl Agent {
                     tools: &tool_definitions,
                     temperature: self.config.temperature,
                     max_tokens: self.config.max_tokens,
+                    thinking: self.config.thinking,
+                    server_tools: &self.config.server_tools,
                 };
                 let cancel = self.cancel.clone();
                 let stream = self.config.stream;
@@ -360,8 +380,13 @@ impl Agent {
                     }
                     result = async {
                         if stream {
-                            let mut on_delta = |text: String| {
-                                emit(hooks, AgentEvent::AssistantDelta { text });
+                            let mut on_delta = |delta: StreamDelta| match delta {
+                                StreamDelta::Text(text) => {
+                                    emit(hooks, AgentEvent::AssistantDelta { text });
+                                }
+                                StreamDelta::Thinking(text) => {
+                                    emit(hooks, AgentEvent::ThinkingDelta { text });
+                                }
                             };
                             self.model.chat_stream(&request, &mut on_delta).await
                         } else {
@@ -389,6 +414,10 @@ impl Agent {
                 tool_calls,
                 usage,
                 finish_reason,
+                thinking,
+                citations,
+                server_tool_uses,
+                provider_data,
                 ..
             } = response;
 
@@ -397,6 +426,10 @@ impl Agent {
             self.history.push(Message::Assistant {
                 content: content.clone(),
                 tool_calls: tool_calls.clone(),
+                thinking: thinking.clone(),
+                citations: citations.clone(),
+                server_tool_uses: server_tool_uses.clone(),
+                provider_data,
             });
             emit(
                 hooks,
@@ -405,10 +438,18 @@ impl Agent {
                     tool_calls: tool_calls.clone(),
                     usage,
                     finish_reason: finish_reason.clone(),
+                    thinking,
+                    citations,
+                    server_tool_uses,
                 },
             );
 
             if tool_calls.is_empty() {
+                // Anthropic 服务端工具可能返回 pause_turn：原始 assistant 内容
+                // 已经写入历史，直接进入下一轮让服务端继续，不能当 Completed。
+                if matches!(finish_reason.as_ref(), Some(FinishReason::Pause)) {
+                    continue;
+                }
                 // 没有工具调用就结束。这里必须检查 Length/ContentFilter：
                 // 否则被截断或过滤的回复会被 UI 当成正常完成。
                 let stop_reason = match finish_reason {
@@ -624,6 +665,10 @@ mod tests {
             model: "mock".into(),
             usage: None,
             finish_reason,
+            thinking: None,
+            citations: vec![],
+            server_tool_uses: vec![],
+            provider_data: None,
         }
     }
 
@@ -766,6 +811,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_turn_continues_without_new_user_message() {
+        let model = mock_model(vec![
+            response(None, vec![], Some(FinishReason::Pause)),
+            response(Some("done"), vec![], Some(FinishReason::Stop)),
+        ]);
+        let mut agent = Agent::new(model, ToolRegistry::new(), AgentConfig::default());
+        let hooks = AgentHooks::default();
+
+        let stop = agent.send(Message::user("hi"), &hooks).await.unwrap();
+
+        assert_eq!(stop, StopReason::Completed);
+        assert_eq!(agent.history().len(), 3);
+        assert!(matches!(
+            &agent.history()[1],
+            Message::Assistant { content: None, .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn max_turns_returns_with_valid_history() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut tools = ToolRegistry::new();
@@ -811,16 +875,20 @@ mod tests {
             &self,
             _ctx: &CallContext<'_>,
             _req: &ChatRequest<'_>,
-            on_delta: &mut (dyn FnMut(String) + Send),
+            on_delta: &mut (dyn FnMut(StreamDelta) + Send),
         ) -> Result<ChatResponse> {
-            on_delta("你".into());
-            on_delta("好".into());
+            on_delta(StreamDelta::Text("你".into()));
+            on_delta(StreamDelta::Text("好".into()));
             Ok(ChatResponse {
                 content: Some("你好".into()),
                 tool_calls: vec![],
                 model: "mock".into(),
                 usage: None,
                 finish_reason: Some(FinishReason::Stop),
+                thinking: None,
+                citations: vec![],
+                server_tool_uses: vec![],
+                provider_data: None,
             })
         }
     }

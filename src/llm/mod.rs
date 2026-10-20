@@ -31,5 +31,6 @@ pub use model::{Model, ModelDefault};
 pub use provider::Provider;
 pub use tool::{Tool, ToolRegistry};
 pub use types::{
-    ChatRequest, ChatResponse, FinishReason, Message, ToolCall, ToolDefinition, Usage,
+    ChatRequest, ChatResponse, FinishReason, Message, ProviderData, ServerToolUse, StreamDelta,
+    ThinkingConfig, ToolCall, ToolDefinition, Usage,
 };

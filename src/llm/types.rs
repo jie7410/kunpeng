@@ -21,6 +21,46 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// Provider 私有的不透明数据。
+///
+/// Anthropic extended thinking 的 `thinking` block 带有 `signature`，下一轮请求
+/// 必须原样回传；`redacted_thinking`、服务端工具等 block 也有同样要求。语义层
+/// 无法为每种 block 建类型，所以把完整 content 数组存这里。
+///
+/// 只有同名 provider 会消费它；切换 provider 时该字段会被忽略。调用方不应修改
+/// `data`，否则签名和原始 block 可能不匹配。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderData {
+    pub provider: String,
+    pub data: serde_json::Value,
+}
+
+/// 扩展思考配置。当前只被 Anthropic 适配器使用；`None` 表示不开启。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkingConfig {
+    /// Anthropic 要求的最小值是 1024，且必须小于 max_tokens。
+    pub budget_tokens: u32,
+}
+
+/// 流式增量。文本和思考分开，避免 UI 把推理内容当正文显示。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamDelta {
+    Text(String),
+    Thinking(String),
+}
+
+/// 服务端工具调用。只用于展示和审计，Agent 不会执行它。
+///
+/// Anthropic 的 `server_tool_use` 由服务端运行，客户端只负责在下一轮把原始
+/// block 回放；`result` 保存对应的 `*_tool_result` 原始 block。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServerToolUse {
+    pub id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+    pub result: Option<serde_json::Value>,
+}
+
 /// 协议无关的会话消息。
 ///
 /// serde 使用 `role` 作为内部 tag，直接落盘即可恢复会话；这也是为什么
@@ -50,6 +90,18 @@ pub enum Message {
         content: Option<String>,
         #[serde(default)]
         tool_calls: Vec<ToolCall>,
+        /// 合并后的 thinking 文本，仅供展示；真正回放用 `provider_data`。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking: Option<String>,
+        /// 原始 citation 对象，结构随 Anthropic 文档类型变化，先保持 JSON。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        citations: Vec<serde_json::Value>,
+        /// 服务端工具调用，只读展示；不会进入本地工具循环。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        server_tool_uses: Vec<ServerToolUse>,
+        /// 原始 provider block。Anthropic 的 thinking/signature 必须靠它原样回传。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_data: Option<ProviderData>,
     },
 
     /// 工具执行结果。`is_error` 只有 Anthropic 协议有原生字段；OpenAI 适配器会
@@ -75,6 +127,10 @@ impl Message {
         Self::Assistant {
             content: Some(c.into()),
             tool_calls: vec![],
+            thinking: None,
+            citations: vec![],
+            server_tool_uses: vec![],
+            provider_data: None,
         }
     }
 
@@ -110,6 +166,10 @@ pub struct ChatRequest<'a> {
     pub tools: &'a [ToolDefinition],
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// 仅 Anthropic 使用；`None` 表示不开启 extended thinking。
+    pub thinking: Option<ThinkingConfig>,
+    /// Anthropic 服务端工具定义，原样传给 API。不要注册到 `ToolRegistry`。
+    pub server_tools: &'a [serde_json::Value],
 }
 
 /// token 统计。字段名沿用 OpenAI 的叫法，Anthropic 的 input/output 在适配器里映射。
@@ -132,6 +192,8 @@ pub enum FinishReason {
     ToolCalls,
     Length,
     ContentFilter,
+    /// Anthropic 服务端工具长任务暂停，需要原样回放后继续请求。
+    Pause,
     Other(String),
 }
 
@@ -152,6 +214,7 @@ impl FinishReason {
             "tool_use" => Self::ToolCalls,
             "max_tokens" => Self::Length,
             "refusal" => Self::ContentFilter,
+            "pause_turn" => Self::Pause,
             other => Self::Other(other.to_string()),
         }
     }
@@ -169,6 +232,14 @@ pub struct ChatResponse {
     pub model: String,
     pub usage: Option<Usage>,
     pub finish_reason: Option<FinishReason>,
+    /// 合并后的 thinking 文本，仅供展示。
+    pub thinking: Option<String>,
+    /// 原始 citation 对象，供 UI 渲染脚注/引用。
+    pub citations: Vec<serde_json::Value>,
+    /// 服务端工具调用，只读展示。
+    pub server_tool_uses: Vec<ServerToolUse>,
+    /// 原始 provider block，供下一轮原样回放。
+    pub provider_data: Option<ProviderData>,
 }
 
 #[cfg(test)]
@@ -187,6 +258,18 @@ mod tests {
                     name: "echo".into(),
                     arguments: serde_json::json!({"text": "hi"}),
                 }],
+                thinking: Some("thinking".into()),
+                citations: vec![serde_json::json!({"type": "char_location"})],
+                server_tool_uses: vec![ServerToolUse {
+                    id: "srv-1".into(),
+                    name: "web_search".into(),
+                    input: serde_json::json!({"query": "rust"}),
+                    result: Some(serde_json::json!({"type": "web_search_tool_result"})),
+                }],
+                provider_data: Some(ProviderData {
+                    provider: "anthropic".into(),
+                    data: serde_json::json!([{"type": "thinking", "thinking": "thinking"}]),
+                }),
             },
             Message::tool_result("call-1", "failed", true),
         ];
@@ -211,6 +294,10 @@ mod tests {
         assert_eq!(
             FinishReason::from_anthropic("max_tokens"),
             FinishReason::Length
+        );
+        assert_eq!(
+            FinishReason::from_anthropic("pause_turn"),
+            FinishReason::Pause
         );
         assert_eq!(
             FinishReason::from_openai("something_new"),

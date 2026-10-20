@@ -4,7 +4,7 @@
 //! 用 mock 替换，也避免每个请求复制 base_url/api_key。
 
 use crate::llm::error::{Error, Result};
-use crate::llm::types::{ChatRequest, ChatResponse};
+use crate::llm::types::{ChatRequest, ChatResponse, StreamDelta};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{RequestBuilder, Response, StatusCode};
@@ -33,18 +33,21 @@ pub trait Protocol: Send + Sync {
     /// 流式调用。默认实现退回非流式，并把完整文本作为单个增量发出去，
     /// 这样新增 provider 可以先只实现 `chat`，Agent 不需要知道它是否支持 SSE。
     ///
-    /// 回调只发文本增量；工具调用的参数分片由适配器自行累积，最终放进
+    /// 回调区分正文和思考内容；工具调用的参数分片由适配器自行累积，最终放进
     /// `ChatResponse.tool_calls`。UI 不应把增量当成最终消息，收到
     /// `AgentEvent::Assistant` 后再以完整内容为准。
     async fn chat_stream(
         &self,
         ctx: &CallContext<'_>,
         req: &ChatRequest<'_>,
-        on_delta: &mut (dyn FnMut(String) + Send),
+        on_delta: &mut (dyn FnMut(StreamDelta) + Send),
     ) -> Result<ChatResponse> {
         let response = self.chat(ctx, req).await?;
         if let Some(content) = &response.content {
-            on_delta(content.clone());
+            on_delta(StreamDelta::Text(content.clone()));
+        }
+        if let Some(thinking) = &response.thinking {
+            on_delta(StreamDelta::Thinking(thinking.clone()));
         }
         Ok(response)
     }

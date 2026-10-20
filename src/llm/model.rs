@@ -1,5 +1,5 @@
 use crate::llm::provider::Provider;
-use crate::llm::types::{ChatRequest, ChatResponse};
+use crate::llm::types::{ChatRequest, ChatResponse, StreamDelta};
 use crate::llm::Result;
 use std::{fmt, sync::Arc};
 
@@ -68,7 +68,7 @@ impl Model {
     pub async fn chat_stream(
         &self,
         req: &ChatRequest<'_>,
-        on_delta: &mut (dyn FnMut(String) + Send),
+        on_delta: &mut (dyn FnMut(StreamDelta) + Send),
     ) -> Result<ChatResponse> {
         let req = ChatRequest {
             temperature: req.temperature.or(self.defaults.temperature),
