@@ -1,0 +1,15 @@
+[package]
+name = "kunpeng-tools"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["tools-builtin"]
+tools-builtin = ["dep:tokio", "dep:reqwest"]
+
+[dependencies]
+kunpeng-core.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }

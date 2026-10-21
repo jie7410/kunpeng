@@ -1,0 +1,13 @@
+[package]
+name = "kunpeng-memory"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kunpeng-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

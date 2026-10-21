@@ -1,0 +1,17 @@
+[package]
+name = "kunpeng-agents"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kunpeng-core.workspace = true
+kunpeng-runtime.workspace = true
+kunpeng-context.workspace = true
+kunpeng-tools.workspace = true
+kunpeng-memory.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+kunpeng-provider.workspace = true

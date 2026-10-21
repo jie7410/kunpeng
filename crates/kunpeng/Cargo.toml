@@ -1,0 +1,20 @@
+[package]
+name = "kunpeng"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kunpeng-core.workspace = true
+kunpeng-provider.workspace = true
+kunpeng-adapter-openai.workspace = true
+kunpeng-adapter-anthropic.workspace = true
+kunpeng-runtime.workspace = true
+kunpeng-agents.workspace = true
+kunpeng-tools.workspace = true
+kunpeng-context.workspace = true
+kunpeng-memory.workspace = true
+kunpeng-multi.workspace = true
+kunpeng-rag.workspace = true
+kunpeng-mcp.workspace = true
+kunpeng-a2a.workspace = true
+kunpeng-anp.workspace = true

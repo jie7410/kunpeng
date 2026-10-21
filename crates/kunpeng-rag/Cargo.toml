@@ -1,0 +1,14 @@
+[package]
+name = "kunpeng-rag"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kunpeng-core.workspace = true
+kunpeng-context.workspace = true
+kunpeng-memory.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+serde_json.workspace = true

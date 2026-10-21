@@ -1,0 +1,20 @@
+[package]
+name = "kunpeng-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "kunpeng"
+path = "src/main.rs"
+doc = false
+
+[lib]
+name = "kunpeng_cli"
+path = "src/lib.rs"
+
+[dependencies]
+kunpeng = { path = "../kunpeng" }
+tokio.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true

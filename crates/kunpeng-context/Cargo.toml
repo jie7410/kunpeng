@@ -1,0 +1,12 @@
+[package]
+name = "kunpeng-context"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kunpeng-core.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+serde_json.workspace = true

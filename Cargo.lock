@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -100,6 +106,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "errno"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -406,9 +422,195 @@ dependencies = [
 name = "kunpeng"
 version = "0.1.0"
 dependencies = [
+ "kunpeng-a2a",
+ "kunpeng-adapter-anthropic",
+ "kunpeng-adapter-openai",
+ "kunpeng-agents",
+ "kunpeng-anp",
+ "kunpeng-context",
+ "kunpeng-core",
+ "kunpeng-mcp",
+ "kunpeng-memory",
+ "kunpeng-multi",
+ "kunpeng-provider",
+ "kunpeng-rag",
+ "kunpeng-runtime",
+ "kunpeng-tools",
+]
+
+[[package]]
+name = "kunpeng-a2a"
+version = "0.1.0"
+dependencies = [
  "async-trait",
+ "kunpeng-core",
+ "kunpeng-multi",
  "reqwest",
  "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "kunpeng-adapter-anthropic"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kunpeng-core",
+ "kunpeng-provider",
+ "reqwest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "kunpeng-adapter-openai"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kunpeng-core",
+ "kunpeng-provider",
+ "reqwest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "kunpeng-agents"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kunpeng-context",
+ "kunpeng-core",
+ "kunpeng-memory",
+ "kunpeng-provider",
+ "kunpeng-runtime",
+ "kunpeng-tools",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "kunpeng-anp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kunpeng-core",
+ "kunpeng-multi",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "kunpeng-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "kunpeng",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "kunpeng-context"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kunpeng-core",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "kunpeng-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "kunpeng-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kunpeng-core",
+ "kunpeng-tools",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "kunpeng-memory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kunpeng-core",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "kunpeng-multi"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kunpeng-agents",
+ "kunpeng-core",
+ "kunpeng-runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "kunpeng-provider"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kunpeng-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "kunpeng-rag"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kunpeng-context",
+ "kunpeng-core",
+ "kunpeng-memory",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "kunpeng-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kunpeng-core",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "kunpeng-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kunpeng-core",
+ "reqwest",
  "serde_json",
  "tokio",
 ]
@@ -754,6 +956,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -864,6 +1076,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
