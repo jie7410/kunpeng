@@ -161,6 +161,24 @@ let registry = kunpeng::default_adapter_registry()?;
 let model = LlmConfig::new("openai", "sk-...").build(&registry)?;
 ```
 
+### 错误分类
+
+`kunpeng_core::Error` 不把所有失败压成字符串：
+
+| 变体 | 用途 |
+|---|---|
+| `Http { kind, message, source }` | 传输失败；`kind` 区分超时/连接/请求/响应体 |
+| `Api { provider, status, body }` | 非 429 的服务端错误 |
+| `RateLimited { provider, retry_after, body }` | 429 限流，可读取建议等待时间 |
+| `Json` | 通用 serde JSON 错误 |
+| `ParseResponse(Box<_>)` | 带 provider/body 上下文的响应解析失败 |
+| `InvalidToolArguments(Box<_>)` | 工具参数 JSON 错误 |
+| `Cancelled` | 调用方取消，包括流式回调返回 `StreamControl::Stop` |
+
+### 流式控制
+
+`chat_stream` 回调接收借用的 `StreamDelta<'_>`，避免默认回退或适配器层重复 clone；返回 `StreamControl::Stop` 可让消费方中途停止读取并得到 `Error::Cancelled`。
+
 ---
 
 ## 作为 library 使用
@@ -821,14 +839,20 @@ let mcp = McpToolset::from_client(std::sync::Arc::new(client)).await?;
 A2A：
 
 ```rust
-use kunpeng::a2a::{A2aClient, PushNotificationConfig};
+use kunpeng::{
+    a2a::{A2aClient, PushNotificationConfig},
+    core::StreamControl,
+};
 
 let a2a = A2aClient::new("https://agent.example/a2a", "planner");
 let reply = a2a.send_message("分析这份数据", Some("ctx-1")).await?;
 
 let mut events = Vec::new();
 let streamed = a2a
-    .send_message_stream("继续分析", Some("ctx-1"), &mut |event| events.push(event.clone()))
+    .send_message_stream("继续分析", Some("ctx-1"), &mut |event| {
+        events.push(event.clone());
+        StreamControl::Continue
+    })
     .await?;
 
 let config = PushNotificationConfig::new("https://host.example/a2a/push");

@@ -9,10 +9,21 @@
 //! Agent 实现或 runtime。
 
 use async_trait::async_trait;
-use kunpeng_core::{Error, Result};
+use kunpeng_core::{Error, HttpErrorKind, Result, StreamControl};
 
 fn http_error(error: reqwest::Error) -> Error {
-    Error::Http(error.to_string())
+    let kind = if error.is_timeout() {
+        HttpErrorKind::Timeout
+    } else if error.is_connect() {
+        HttpErrorKind::Connect
+    } else if error.is_body() {
+        HttpErrorKind::Body
+    } else if error.is_request() {
+        HttpErrorKind::Request
+    } else {
+        HttpErrorKind::Other
+    };
+    Error::http_with_source(kind, error.to_string(), error)
 }
 use kunpeng_multi::{AgentEnvelope, AgentId, AgentPayload, AgentProtocol};
 use serde::{Deserialize, Serialize};
@@ -185,7 +196,7 @@ impl A2aClient {
         on_event: &mut F,
     ) -> Result<A2aResponse>
     where
-        F: FnMut(&Value) + Send,
+        F: FnMut(&Value) -> StreamControl + Send,
     {
         let request_id = self.next_request_id();
         let message_id = format!("{}-{request_id}", self.agent_id);
@@ -199,7 +210,7 @@ impl A2aClient {
     /// 重新订阅一个已有 task 的 SSE 事件。
     pub async fn resubscribe<F>(&self, task_id: &str, on_event: &mut F) -> Result<Value>
     where
-        F: FnMut(&Value) + Send,
+        F: FnMut(&Value) -> StreamControl + Send,
     {
         let request_id = self.next_request_id();
         self.post_streaming_rpc(
@@ -278,7 +289,7 @@ impl A2aClient {
 
     async fn post_streaming_rpc<F>(&self, request: Value, on_event: &mut F) -> Result<Value>
     where
-        F: FnMut(&Value) + Send,
+        F: FnMut(&Value) -> StreamControl + Send,
     {
         let response = self
             .http
@@ -317,7 +328,9 @@ impl A2aClient {
                     )));
                 }
                 if let Some(result) = event.get("result").cloned() {
-                    on_event(&result);
+                    if on_event(&result) == StreamControl::Stop {
+                        return Err(Error::Cancelled);
+                    }
                     last = Some(result);
                 }
             }
@@ -339,7 +352,9 @@ impl A2aClient {
                 )));
             }
             if let Some(result) = event.get("result").cloned() {
-                on_event(&result);
+                if on_event(&result) == StreamControl::Stop {
+                    return Err(Error::Cancelled);
+                }
                 last = Some(result);
             }
         }
@@ -501,7 +516,7 @@ fn is_event_stream(response: &reqwest::Response) -> bool {
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 #[derive(Default)]
@@ -667,6 +682,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stops_stream_when_consumer_requests_it() {
+        let body = concat!(
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"id\":\"task-1\",\"status\":{\"state\":\"working\"}}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"id\":\"task-1\",\"status\":{\"state\":\"completed\"}}}\n\n"
+        );
+        let (endpoint, _server) = serve_once_with(body.to_string(), "text/event-stream");
+        let client = A2aClient::new(endpoint, "planner");
+        let result = client
+            .send_message_stream("hello", None, &mut |_| StreamControl::Stop)
+            .await;
+        assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    #[tokio::test]
     async fn streams_message_events() {
         let body = concat!(
             "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"id\":\"task-1\",\"status\":{\"state\":\"working\"}}}\n\n",
@@ -677,7 +706,8 @@ mod tests {
         let mut seen = Vec::new();
         let response = client
             .send_message_stream("hello", Some("ctx-1"), &mut |event| {
-                seen.push(event.clone())
+                seen.push(event.clone());
+                StreamControl::Continue
             })
             .await
             .unwrap();

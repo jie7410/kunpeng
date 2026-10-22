@@ -13,10 +13,21 @@
 //! 修改 `kunpeng-multi`。
 
 use async_trait::async_trait;
-use kunpeng_core::{Error, Result};
+use kunpeng_core::{Error, HttpErrorKind, Result};
 
 fn http_error(error: reqwest::Error) -> Error {
-    Error::Http(error.to_string())
+    let kind = if error.is_timeout() {
+        HttpErrorKind::Timeout
+    } else if error.is_connect() {
+        HttpErrorKind::Connect
+    } else if error.is_body() {
+        HttpErrorKind::Body
+    } else if error.is_request() {
+        HttpErrorKind::Request
+    } else {
+        HttpErrorKind::Other
+    };
+    Error::http_with_source(kind, error.to_string(), error)
 }
 use kunpeng_multi::{AgentEnvelope, AgentProtocol};
 use serde::{Deserialize, Serialize};
@@ -245,7 +256,7 @@ impl AnpClient {
         if text.trim().is_empty() {
             return Ok(Value::Null);
         }
-        serde_json::from_str(&text).map_err(Error::Parse)
+        Ok(serde_json::from_str(&text)?)
     }
 
     /// 把内核信封转换成当前 client 的 JSON-LD profile。

@@ -9,14 +9,14 @@
 //! - 工具参数在 JSON 里是**字符串**，内部类型是 `Value`，两侧都要显式转换。
 
 use async_trait::async_trait;
-use kunpeng_core::error::{Error, Result};
+use kunpeng_core::error::{Error, InvalidToolArgumentsError, Result};
 use kunpeng_core::types::{
     ChatRequest, ChatResponse, Content, ContentPart, FinishReason, ImageDetail, ImageSource,
-    Message, StreamDelta, ToolCall, ToolChoice, Usage,
+    Message, StreamControl, StreamDelta, ToolCall, ToolChoice, Usage,
 };
 use kunpeng_provider::adapter::{
-    api_error, consume_sse, http_error, is_event_stream, parse_response, send_with_retry, truncate,
-    Adapter, CallContext,
+    api_error, consume_sse, http_error, is_event_stream, parse_response, retry_after,
+    send_with_retry, truncate, Adapter, CallContext,
 };
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, collections::BTreeMap};
@@ -106,8 +106,9 @@ impl Adapter for OpenAiAdapter {
         if !status.is_success() {
             // 非 2xx 的 body 可能是 JSON 错误，也可能是网关 HTML。先读文本，
             // 交给 api_error 截断，保证错误里能看到服务端原话。
+            let retry_after = retry_after(response.headers());
             let body = response.text().await.unwrap_or_default();
-            return Err(api_error(status, body));
+            return Err(api_error("openai", status, body, retry_after));
         }
 
         // 不直接 response.json()：解析失败时要把 body 片段带进错误。
@@ -122,7 +123,7 @@ impl Adapter for OpenAiAdapter {
         &self,
         ctx: &CallContext<'_>,
         req: &ChatRequest<'_>,
-        on_delta: &mut (dyn FnMut(StreamDelta) + Send),
+        on_delta: &mut (dyn for<'a> FnMut(StreamDelta<'a>) -> StreamControl + Send),
     ) -> Result<ChatResponse> {
         if !req.server_tools.is_empty() {
             return Err(Error::InvalidConfig(
@@ -140,8 +141,9 @@ impl Adapter for OpenAiAdapter {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = retry_after(response.headers());
             let body = response.text().await.unwrap_or_default();
-            return Err(api_error(status, body));
+            return Err(api_error("openai", status, body, retry_after));
         }
 
         // 兼容端点可能忽略 stream=true，直接返回 JSON。按 content-type 回退，
@@ -185,7 +187,9 @@ impl Adapter for OpenAiAdapter {
                 if let Some(text) = choice.delta.content {
                     if !text.is_empty() {
                         content.push_str(&text);
-                        on_delta(StreamDelta::Text(text));
+                        if on_delta(StreamDelta::Text(&text)) == StreamControl::Stop {
+                            return Err(Error::Cancelled);
+                        }
                     }
                 }
 
@@ -358,10 +362,12 @@ fn parse_tool_arguments(tool: &str, raw: &str) -> Result<serde_json::Value> {
     if raw.is_empty() {
         return Ok(serde_json::json!({}));
     }
-    serde_json::from_str(raw).map_err(|source| Error::InvalidToolArguments {
-        tool: tool.to_string(),
-        raw: truncate(raw, 256),
-        source,
+    serde_json::from_str(raw).map_err(|source| {
+        Error::InvalidToolArguments(Box::new(InvalidToolArgumentsError::new(
+            tool.to_string(),
+            truncate(raw, 256),
+            source,
+        )))
     })
 }
 
@@ -759,7 +765,7 @@ mod tests {
     #[test]
     fn invalid_tool_arguments_are_not_silently_null() {
         let error = parse_tool_arguments("echo", "{not json").unwrap_err();
-        assert!(matches!(error, Error::InvalidToolArguments { .. }));
+        assert!(matches!(error, Error::InvalidToolArguments(_)));
     }
 
     #[test]

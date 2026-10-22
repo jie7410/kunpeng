@@ -1,9 +1,21 @@
 use crate::Tool;
 use async_trait::async_trait;
 use kunpeng_core::error::{Error, Result};
+use kunpeng_core::HttpErrorKind;
 
 fn http_error(error: reqwest::Error) -> Error {
-    Error::Http(error.to_string())
+    let kind = if error.is_timeout() {
+        HttpErrorKind::Timeout
+    } else if error.is_connect() {
+        HttpErrorKind::Connect
+    } else if error.is_body() {
+        HttpErrorKind::Body
+    } else if error.is_request() {
+        HttpErrorKind::Request
+    } else {
+        HttpErrorKind::Other
+    };
+    Error::http_with_source(kind, error.to_string(), error)
 }
 use kunpeng_core::types::ToolDefinition;
 use std::time::Duration;
@@ -86,10 +98,7 @@ impl Tool for HttpFetchTool {
         let bytes = &bytes[..bytes.len().min(self.max_bytes)];
         let body = String::from_utf8_lossy(bytes).into_owned();
         if !status.is_success() {
-            return Err(Error::Api {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(Error::api("http_fetch", status.as_u16(), body, None));
         }
         Ok(body)
     }

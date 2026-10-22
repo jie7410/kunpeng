@@ -11,6 +11,8 @@
 - `agents::Agent`、`agents::RunContext` 的构造/访问
 - `agents::ReActAgent`
 - `core::ChatModel`（`chat` 必需，`chat_stream` 有默认实现）
+- `core::Error` 的分类语义（HTTP kind/source、Api/RateLimited、Json/ParseResponse）
+- `core::StreamDelta<'a>`
 - `core::Message`、`ChatRequest`、`ChatResponse` 的语义字段
 - `runtime::AgentEvent`、`StopReason`、`ToolDecision`
 - `tools::Tool`、`ToolRegistry`、`ToolPolicy`
@@ -24,6 +26,7 @@
 可以使用，但签名可能随功能完善调整；升级时优先提供默认实现或迁移函数。
 
 - `agents::AgentStrategy`
+- `core::StreamControl`
 - `provider::Provider`
 - `provider::Adapter`、`provider::AdapterRegistry`、`provider::CallContext`
 - `adapter_openai::OpenAiAdapter`
@@ -111,9 +114,9 @@ pub trait ChatModel {
 
 | 协议 | 放置 |
 |---|---|
-| MCP | `tools` / `context`，实现 `ToolProvider` 或资源适配 |
-| A2A | `multi` 的外部适配器，映射 `AgentEnvelope` / Task |
-| ANP | 独立 crate，DID/JSON-LD 类型不进入 core |
+| MCP | `kunpeng-mcp`，实现 `ToolProvider`，resources/prompts/sampling 保持独立 |
+| A2A | `kunpeng-a2a`，映射 `AgentEnvelope` / Task，支持同步、流式与 push 配置 |
+| ANP | `kunpeng-anp`，JSON-LD 信封与 DID 发现 |
 
 `LocalBus` 只服务进程内编排；A2A/ANP 需要更丰富的任务/流式/身份模型时，使用独立协议 trait 或 crate。
 

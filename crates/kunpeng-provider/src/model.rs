@@ -1,7 +1,7 @@
 use crate::provider::Provider;
 use async_trait::async_trait;
 use kunpeng_core::types::{ChatRequest, ChatResponse, StreamDelta};
-use kunpeng_core::{ChatModel, Result};
+use kunpeng_core::{ChatModel, Result, StreamControl};
 use std::{fmt, sync::Arc};
 
 /// 模型级默认值。请求里的同名字段优先；请求留空时才回落到这里。
@@ -68,7 +68,7 @@ impl Model {
     pub async fn chat_stream(
         &self,
         req: &ChatRequest<'_>,
-        on_delta: &mut (dyn FnMut(StreamDelta) + Send),
+        on_delta: &mut (dyn for<'a> FnMut(StreamDelta<'a>) -> StreamControl + Send),
     ) -> Result<ChatResponse> {
         let mut req = *req;
         req.temperature = req.temperature.or(self.defaults.temperature);
@@ -86,7 +86,7 @@ impl ChatModel for Model {
     async fn chat_stream(
         &self,
         req: &ChatRequest<'_>,
-        on_delta: &mut (dyn FnMut(StreamDelta) + Send),
+        on_delta: &mut (dyn for<'a> FnMut(StreamDelta<'a>) -> StreamControl + Send),
     ) -> Result<ChatResponse> {
         Model::chat_stream(self, req, on_delta).await
     }

@@ -7,9 +7,9 @@ pub mod error;
 pub mod types;
 
 pub use chat_model::ChatModel;
-pub use error::{Error, Result};
+pub use error::{Error, HttpErrorKind, InvalidToolArgumentsError, ParseResponseError, Result};
 pub use types::{
     ChatRequest, ChatResponse, Content, ContentPart, FinishReason, ImageDetail, ImageSource,
-    Message, ProviderData, ProviderOptions, ServerToolUse, StreamDelta, ThinkingConfig,
-    TokenBudget, ToolCall, ToolChoice, ToolDefinition, Usage,
+    Message, ProviderData, ProviderOptions, ServerToolUse, StreamControl, StreamDelta,
+    ThinkingConfig, TokenBudget, ToolCall, ToolChoice, ToolDefinition, Usage,
 };

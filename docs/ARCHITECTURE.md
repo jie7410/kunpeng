@@ -209,11 +209,12 @@ sequenceDiagram
 | `ThinkingConfig` | 扩展思考预算 | Anthropic `budget_tokens` |
 | `ProviderData` | provider 原始 block | thinking/signature 和未知 block 原样回放 |
 | `ServerToolUse` | 服务端工具只读投影 | 展示 `server_tool_use`，不参与本地执行 |
-| `StreamDelta` | 流式增量 | 区分正文与思考内容 |
+| `StreamDelta<'a>` | 流式增量 | 借用正文/思考字符串，避免回调层 clone |
+| `StreamControl` | 流式控制 | 消费方可以停止继续读取网络流 |
 | `AgentEvent` | 过程中的事件 | UI 渲染进度、工具状态、错误 |
 | `StopReason` | 整个循环为什么停止 | 区分正常完成、超长、达到轮数、取消 |
 | `FinishReason` | 单次模型响应为什么结束 | 统一 OpenAI/Anthropic 的不同字符串 |
-| `Error` | 分类错误 | 配置、HTTP、API、解析、工具、取消分别处理 |
+| `Error` | 分类错误 | HTTP 分类/source、Api/RateLimited、Json/ParseResponse、工具、取消分别处理 |
 
 `Message` 用 enum 而不是 `role: String + content: String`，因为 assistant 至少有三种状态：纯文本、纯工具调用、文本 + 工具调用；tool 结果还必须绑定 `tool_call_id`。非法组合在编译期就不存在。
 
@@ -312,7 +313,7 @@ Tauri 可以直接把事件 `emit` 给前端；CLI 直接打印；测试收集�
 
 ### 9. 流式在协议层收敛，Agent 只消费增量事件
 
-`Adapter::chat_stream` 的默认实现退回 `chat`，把完整文本作为单个增量发出。新增 provider 可以先只实现非流式，Agent 不需要判断对方是否支持 SSE。
+`Adapter::chat_stream` 的默认实现退回 `chat`，先发 thinking、再发 text，避免 UI 把推理内容排在正文之后。回调接收借用的 `StreamDelta<'_>`，默认回退不会为了发事件 clone 完整回复；消费方返回 `StreamControl::Stop` 后适配器停止读取并返回 `Error::Cancelled`。新增 provider 可以先只实现非流式，Agent 不需要判断对方是否支持 SSE。
 
 两个适配器各自处理 SSE：
 

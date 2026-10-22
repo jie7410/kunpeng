@@ -4,15 +4,27 @@
 //! 用 mock 替换，也避免每个请求复制 base_url/api_key。
 
 use async_trait::async_trait;
-use kunpeng_core::error::{Error, Result};
-use kunpeng_core::types::{ChatRequest, ChatResponse, StreamDelta};
+use kunpeng_core::error::{Error, ParseResponseError, Result};
+use kunpeng_core::types::{ChatRequest, ChatResponse, StreamControl, StreamDelta};
+use kunpeng_core::HttpErrorKind;
 use reqwest::header::{HeaderMap, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{RequestBuilder, Response, StatusCode};
 use std::time::Duration;
 
-/// 把 reqwest 传输错误收敛成 core 的统一错误。
+/// 把 reqwest 传输错误收敛成 core 的结构化错误，同时保留 source。
 pub fn http_error(error: reqwest::Error) -> Error {
-    Error::Http(error.to_string())
+    let kind = if error.is_timeout() {
+        HttpErrorKind::Timeout
+    } else if error.is_connect() {
+        HttpErrorKind::Connect
+    } else if error.is_body() {
+        HttpErrorKind::Body
+    } else if error.is_request() {
+        HttpErrorKind::Request
+    } else {
+        HttpErrorKind::Other
+    };
+    Error::http_with_source(kind, error.to_string(), error)
 }
 
 /// 单次请求的共享上下文。
@@ -67,14 +79,18 @@ pub trait Adapter: Send + Sync {
         &self,
         ctx: &CallContext<'_>,
         req: &ChatRequest<'_>,
-        on_delta: &mut (dyn FnMut(StreamDelta) + Send),
+        on_delta: &mut (dyn for<'a> FnMut(StreamDelta<'a>) -> StreamControl + Send),
     ) -> Result<ChatResponse> {
         let response = self.chat(ctx, req).await?;
-        if let Some(content) = &response.content {
-            on_delta(StreamDelta::Text(content.clone()));
-        }
         if let Some(thinking) = &response.thinking {
-            on_delta(StreamDelta::Thinking(thinking.clone()));
+            if on_delta(StreamDelta::Thinking(thinking)) == StreamControl::Stop {
+                return Err(Error::Cancelled);
+            }
+        }
+        if let Some(content) = &response.content {
+            if on_delta(StreamDelta::Text(content)) == StreamControl::Stop {
+                return Err(Error::Cancelled);
+            }
         }
         Ok(response)
     }
@@ -247,7 +263,7 @@ fn is_retryable(status: StatusCode) -> bool {
 
 /// 只解析整数秒形式。HTTP-date 形式在 LLM 网关里很少见，解析失败时回落到指数退避
 /// 更简单；上限 60 秒，避免服务端给出一个让 UI 看起来卡死的值。
-fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     let seconds = headers
         .get(RETRY_AFTER)?
         .to_str()
@@ -258,13 +274,20 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(seconds.min(60)))
 }
 
-/// 非 2xx 统一成 `Error::Api`。body 截断到 1KiB：有些网关会把整个 HTML 错误页
-/// 塞回来，原样放进错误链会让日志和 UI 难以阅读。
-pub fn api_error(status: StatusCode, body: String) -> Error {
-    Error::Api {
-        status: status.as_u16(),
-        body: truncate(&body, 1024),
-    }
+/// 非 2xx 统一成 `Api` 或 `RateLimited`。body 截断到 1KiB：有些网关会把整个
+/// HTML 错误页塞回来，原样放进错误链会让日志和 UI 难以阅读。
+pub fn api_error(
+    provider: &'static str,
+    status: StatusCode,
+    body: String,
+    retry_after: Option<Duration>,
+) -> Error {
+    Error::api(
+        provider,
+        status.as_u16(),
+        truncate(&body, 1024),
+        retry_after,
+    )
 }
 
 /// 解析响应体。
@@ -275,10 +298,12 @@ pub fn parse_response<T: serde::de::DeserializeOwned>(
     provider: &'static str,
     body: &str,
 ) -> Result<T> {
-    serde_json::from_str(body).map_err(|source| Error::ParseResponse {
-        provider,
-        body: truncate(body, 1024),
-        source,
+    serde_json::from_str(body).map_err(|source| {
+        Error::ParseResponse(Box::new(ParseResponseError::new(
+            provider,
+            truncate(body, 1024),
+            source,
+        )))
     })
 }
 
@@ -359,5 +384,23 @@ mod tests {
                 data: "北京".into(),
             }]
         );
+    }
+
+    #[test]
+    fn maps_429_to_rate_limited() {
+        let error = api_error(
+            "openai",
+            StatusCode::TOO_MANY_REQUESTS,
+            "slow down".into(),
+            Some(Duration::from_secs(1)),
+        );
+        assert!(matches!(
+            error,
+            Error::RateLimited {
+                provider: "openai",
+                retry_after: Some(_),
+                ..
+            }
+        ));
     }
 }

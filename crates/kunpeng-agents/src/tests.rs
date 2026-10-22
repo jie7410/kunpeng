@@ -1,6 +1,6 @@
 use super::*;
 use async_trait::async_trait;
-use kunpeng_core::types::{ChatResponse, ToolDefinition};
+use kunpeng_core::types::{ChatResponse, StreamControl, ToolDefinition};
 use kunpeng_core::Error;
 use kunpeng_memory::InMemorySessionStore;
 use kunpeng_provider::{Adapter, CallContext, Model, Provider};
@@ -384,10 +384,10 @@ impl Adapter for StreamingAdapter {
         &self,
         _ctx: &CallContext<'_>,
         _req: &ChatRequest<'_>,
-        on_delta: &mut (dyn FnMut(StreamDelta) + Send),
+        on_delta: &mut (dyn for<'a> FnMut(StreamDelta<'a>) -> StreamControl + Send),
     ) -> Result<ChatResponse> {
-        on_delta(StreamDelta::Text("你".into()));
-        on_delta(StreamDelta::Text("好".into()));
+        assert_eq!(on_delta(StreamDelta::Text("你")), StreamControl::Continue);
+        assert_eq!(on_delta(StreamDelta::Text("好")), StreamControl::Continue);
         Ok(ChatResponse::new("mock")
             .with_content("你好")
             .with_finish_reason(FinishReason::Stop))

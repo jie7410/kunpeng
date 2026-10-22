@@ -15,14 +15,14 @@
 //! - thinking 文本只用于展示，真正回放依赖原始 block。
 
 use async_trait::async_trait;
-use kunpeng_core::error::{Error, Result};
+use kunpeng_core::error::{Error, InvalidToolArgumentsError, Result};
 use kunpeng_core::types::{
     ChatRequest, ChatResponse, Content, ContentPart, FinishReason, ImageSource, Message,
-    ProviderData, ServerToolUse, StreamDelta, ToolCall, ToolChoice, Usage,
+    ProviderData, ServerToolUse, StreamControl, StreamDelta, ToolCall, ToolChoice, Usage,
 };
 use kunpeng_provider::adapter::{
-    api_error, consume_sse, http_error, is_event_stream, parse_response, send_with_retry, truncate,
-    Adapter, CallContext,
+    api_error, consume_sse, http_error, is_event_stream, parse_response, retry_after,
+    send_with_retry, truncate, Adapter, CallContext,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -70,8 +70,9 @@ impl Adapter for AnthropicAdapter {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = retry_after(response.headers());
             let body = response.text().await.unwrap_or_default();
-            return Err(api_error(status, body));
+            return Err(api_error("anthropic", status, body, retry_after));
         }
 
         let raw = response.text().await.map_err(http_error)?;
@@ -89,7 +90,7 @@ impl Adapter for AnthropicAdapter {
         &self,
         ctx: &CallContext<'_>,
         req: &ChatRequest<'_>,
-        on_delta: &mut (dyn FnMut(StreamDelta) + Send),
+        on_delta: &mut (dyn for<'a> FnMut(StreamDelta<'a>) -> StreamControl + Send),
     ) -> Result<ChatResponse> {
         let body = build_body(ctx.model, req, true)?;
         let response = send_with_retry(ctx.max_retries, || {
@@ -103,8 +104,9 @@ impl Adapter for AnthropicAdapter {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = retry_after(response.headers());
             let body = response.text().await.unwrap_or_default();
-            return Err(api_error(status, body));
+            return Err(api_error("anthropic", status, body, retry_after));
         }
 
         // 代理/兼容端点可能忽略 stream=true，返回普通 JSON。
@@ -159,8 +161,10 @@ impl Adapter for AnthropicAdapter {
                                 .and_then(serde_json::Value::as_array)
                                 .cloned()
                                 .unwrap_or_default();
-                            if !text.is_empty() {
-                                on_delta(StreamDelta::Text(text.clone()));
+                            if !text.is_empty()
+                                && on_delta(StreamDelta::Text(&text)) == StreamControl::Stop
+                            {
+                                return Err(Error::Cancelled);
                             }
                             StreamBlock::Text { text, citations }
                         }
@@ -175,8 +179,10 @@ impl Adapter for AnthropicAdapter {
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or_default()
                                 .to_string();
-                            if !thinking.is_empty() {
-                                on_delta(StreamDelta::Thinking(thinking.clone()));
+                            if !thinking.is_empty()
+                                && on_delta(StreamDelta::Thinking(&thinking)) == StreamControl::Stop
+                            {
+                                return Err(Error::Cancelled);
                             }
                             StreamBlock::Thinking {
                                 thinking,
@@ -232,7 +238,9 @@ impl Adapter for AnthropicAdapter {
                                 // 比 panic 更安全，这里直接忽略这个分片。
                                 _ => return Ok(()),
                             }
-                            on_delta(StreamDelta::Text(text));
+                            if on_delta(StreamDelta::Text(&text)) == StreamControl::Stop {
+                                return Err(Error::Cancelled);
+                            }
                         }
                     }
                     AnthropicStreamDelta::CitationsDelta { citation } => {
@@ -247,7 +255,10 @@ impl Adapter for AnthropicAdapter {
                             }) = blocks.get_mut(&index)
                             {
                                 buffer.push_str(&thinking);
-                                on_delta(StreamDelta::Thinking(thinking));
+                                if on_delta(StreamDelta::Thinking(&thinking)) == StreamControl::Stop
+                                {
+                                    return Err(Error::Cancelled);
+                                }
                             }
                         }
                     }
@@ -633,10 +644,12 @@ fn to_anthropic_tool_choice(choice: &ToolChoice) -> serde_json::Value {
 
 /// 解析累积后的工具参数 JSON。错误里保留片段，和 OpenAI 适配器保持一致。
 fn parse_stream_arguments(tool: &str, raw: &str) -> Result<serde_json::Value> {
-    serde_json::from_str(raw).map_err(|source| Error::InvalidToolArguments {
-        tool: tool.to_string(),
-        raw: truncate(raw, 256),
-        source,
+    serde_json::from_str(raw).map_err(|source| {
+        Error::InvalidToolArguments(Box::new(InvalidToolArgumentsError::new(
+            tool.to_string(),
+            truncate(raw, 256),
+            source,
+        )))
     })
 }
 

@@ -5,7 +5,7 @@
 
 use crate::adapter::{http_error, Adapter, CallContext};
 use kunpeng_core::error::{Error, Result};
-use kunpeng_core::types::{ChatRequest, ChatResponse, StreamDelta};
+use kunpeng_core::types::{ChatRequest, ChatResponse, StreamControl, StreamDelta};
 use std::{sync::Arc, time::Duration};
 
 pub struct Provider {
@@ -73,7 +73,7 @@ impl Provider {
         &self,
         model: &str,
         req: &ChatRequest<'_>,
-        on_delta: &mut (dyn FnMut(StreamDelta) + Send),
+        on_delta: &mut (dyn for<'a> FnMut(StreamDelta<'a>) -> StreamControl + Send),
     ) -> Result<ChatResponse> {
         let ctx = self.context(model);
         self.adapter.chat_stream(&ctx, req, on_delta).await

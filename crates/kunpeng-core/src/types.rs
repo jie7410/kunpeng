@@ -59,12 +59,26 @@ impl ThinkingConfig {
     }
 }
 
+/// 流式回调的控制信号。
+///
+/// 消费方（UI、取消令牌、预算控制器）返回 `Stop` 后，适配器应停止读取网络流并
+/// 返回 `Error::Cancelled`，而不是继续消费和计费。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StreamControl {
+    Continue,
+    Stop,
+}
+
 /// 流式增量。文本和思考分开，避免 UI 把推理内容当正文显示。
+///
+/// 借用切片：适配器可以直接把已解析的字符串交给回调，默认回退也不需要为了
+/// 发事件 clone 完整回复；需要持久化的消费方自行 `to_owned()`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum StreamDelta {
-    Text(String),
-    Thinking(String),
+pub enum StreamDelta<'a> {
+    Text(&'a str),
+    Thinking(&'a str),
 }
 
 /// 上下文预算。只限制历史消息，不包含工具 schema 和输出预留。
@@ -403,7 +417,7 @@ impl Usage {
         Self {
             prompt_tokens,
             completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
         }
     }
 }

@@ -3,7 +3,9 @@
 use crate::{AgentStrategy, RunContext};
 use async_trait::async_trait;
 use kunpeng_context::ContextBuilder;
-use kunpeng_core::types::{ChatRequest, FinishReason, Message, StreamDelta, ToolCall};
+use kunpeng_core::types::{
+    ChatRequest, FinishReason, Message, StreamControl, StreamDelta, ToolCall,
+};
 use kunpeng_core::{ChatModel, Result};
 use kunpeng_memory::SessionStore;
 use kunpeng_runtime::{
@@ -234,14 +236,20 @@ async fn run_react(history: &mut Vec<Message>, ctx: &RunContext<'_>) -> Result<S
                 }
                 result = async {
                     if stream {
-                        let mut on_delta = |delta: StreamDelta| match delta {
-                            StreamDelta::Text(text) => {
-                                emit(ctx.hooks, AgentEvent::AssistantDelta { text });
+                        let mut on_delta = |delta: StreamDelta<'_>| {
+                            if ctx.cancel.is_cancelled() {
+                                return StreamControl::Stop;
                             }
-                            StreamDelta::Thinking(text) => {
-                                emit(ctx.hooks, AgentEvent::ThinkingDelta { text });
+                            match delta {
+                                StreamDelta::Text(text) => {
+                                    emit(ctx.hooks, AgentEvent::AssistantDelta { text: text.to_string() });
+                                }
+                                StreamDelta::Thinking(text) => {
+                                    emit(ctx.hooks, AgentEvent::ThinkingDelta { text: text.to_string() });
+                                }
+                                _ => {}
                             }
-                            _ => {}
+                            StreamControl::Continue
                         };
                         ctx.model.chat_stream(&request, &mut on_delta).await
                     } else {
@@ -249,6 +257,15 @@ async fn run_react(history: &mut Vec<Message>, ctx: &RunContext<'_>) -> Result<S
                     }
                 } => match result {
                     Ok(response) => response,
+                    Err(kunpeng_core::Error::Cancelled) => {
+                        emit(
+                            ctx.hooks,
+                            AgentEvent::Finished {
+                                stop_reason: StopReason::Cancelled,
+                            },
+                        );
+                        return Ok(StopReason::Cancelled);
+                    }
                     Err(error) => {
                         emit(
                             ctx.hooks,
