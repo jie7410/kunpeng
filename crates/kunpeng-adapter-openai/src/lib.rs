@@ -15,7 +15,7 @@ use kunpeng_core::types::{
     Message, StreamControl, StreamDelta, ToolCall, ToolChoice, Usage,
 };
 use kunpeng_provider::adapter::{
-    api_error, consume_sse, http_error, is_event_stream, parse_response, retry_after,
+    api_error, consume_sse, is_event_stream, parse_response, read_body, retry_after,
     send_with_retry, truncate, Adapter, CallContext,
 };
 use serde::{Deserialize, Serialize};
@@ -94,7 +94,8 @@ impl Adapter for OpenAiAdapter {
 
         // base_url 约定包含版本前缀（如 /v1），这里只拼资源路径。
         // 闭包会在每次重试时重新构造并序列化请求体。
-        let response = send_with_retry(ctx.max_retries, || {
+        // timeout 只覆盖“到响应头为止”；body 读取由 read_body 单独限时。
+        let response = send_with_retry(ctx.max_retries, ctx.timeout, || {
             ctx.http
                 .post(format!("{}/chat/completions", ctx.base_url))
                 .bearer_auth(ctx.api_key)
@@ -107,12 +108,12 @@ impl Adapter for OpenAiAdapter {
             // 非 2xx 的 body 可能是 JSON 错误，也可能是网关 HTML。先读文本，
             // 交给 api_error 截断，保证错误里能看到服务端原话。
             let retry_after = retry_after(response.headers());
-            let body = response.text().await.unwrap_or_default();
+            let body = read_body(response, ctx.timeout).await.unwrap_or_default();
             return Err(api_error("openai", status, body, retry_after));
         }
 
         // 不直接 response.json()：解析失败时要把 body 片段带进错误。
-        let raw = response.text().await.map_err(http_error)?;
+        let raw = read_body(response, ctx.timeout).await?;
         let parsed: OpenAiResponse = parse_response("openai", &raw)?;
         into_chat_response(parsed, ctx.model)
     }
@@ -131,7 +132,7 @@ impl Adapter for OpenAiAdapter {
             ));
         }
         let body = build_body(ctx.model, req, true)?;
-        let response = send_with_retry(ctx.max_retries, || {
+        let response = send_with_retry(ctx.max_retries, ctx.timeout, || {
             ctx.http
                 .post(format!("{}/chat/completions", ctx.base_url))
                 .bearer_auth(ctx.api_key)
@@ -142,14 +143,14 @@ impl Adapter for OpenAiAdapter {
         let status = response.status();
         if !status.is_success() {
             let retry_after = retry_after(response.headers());
-            let body = response.text().await.unwrap_or_default();
+            let body = read_body(response, ctx.timeout).await.unwrap_or_default();
             return Err(api_error("openai", status, body, retry_after));
         }
 
         // 兼容端点可能忽略 stream=true，直接返回 JSON。按 content-type 回退，
         // 避免把一份普通响应当成空的 SSE 流。
         if !is_event_stream(&response) {
-            let raw = response.text().await.map_err(http_error)?;
+            let raw = read_body(response, ctx.timeout).await?;
             let parsed: OpenAiResponse = parse_response("openai", &raw)?;
             return into_chat_response(parsed, ctx.model);
         }
@@ -161,7 +162,7 @@ impl Adapter for OpenAiAdapter {
         let mut tool_calls: BTreeMap<usize, ToolCallAccum> = BTreeMap::new();
         let mut done = false;
 
-        consume_sse(response, |event| {
+        consume_sse(response, ctx.timeout, |event| {
             if done || event.data.is_empty() {
                 return Ok(());
             }
@@ -242,7 +243,14 @@ fn into_chat_response(parsed: OpenAiResponse, fallback_model: &str) -> Result<Ch
         model,
         choices,
         usage,
+        error,
     } = parsed;
+
+    // 部分兼容网关用 200 状态码携带 {"error": {...}}；先于 choices 检查，
+    // 避免“choices 为空”掩盖真实原因。
+    if let Some(error) = error {
+        return Err(Error::Other(format!("OpenAI 返回错误: {}", error.message)));
+    }
 
     // 没有传 n，默认只返回一个 choice。多 choice 属于另一套交互模型，
     // Agent 的循环只消费第一个。
@@ -596,6 +604,9 @@ struct OpenAiResponse {
     choices: Vec<OpenAiChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
+    /// 兼容网关有时在 200 状态码下返回错误对象。
+    #[serde(default)]
+    error: Option<OpenAiError>,
 }
 
 #[derive(Deserialize)]
@@ -652,7 +663,7 @@ struct OpenAiStreamResponse {
     model: Option<String>,
     choices: Vec<OpenAiStreamChoice>,
     usage: Option<OpenAiUsage>,
-    error: Option<OpenAiStreamError>,
+    error: Option<OpenAiError>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -687,8 +698,9 @@ struct OpenAiStreamFunction {
     arguments: Option<String>,
 }
 
+/// 协议错误对象。200 状态码下的非流式响应和流式过程中的错误帧共用。
 #[derive(Debug, Deserialize)]
-struct OpenAiStreamError {
+struct OpenAiError {
     #[serde(default)]
     message: String,
 }
@@ -855,5 +867,258 @@ mod tests {
         assert_eq!(value["tool_choice"]["function"]["name"], "echo");
         assert_eq!(value["stop"][0], "END");
         assert_eq!(value["seed"], 7);
+    }
+
+    // ========================================================================
+    // wire 级测试：用本地 TCP 服务器覆盖完整的 HTTP 请求路径（URL、鉴权头、
+    // 错误码映射、SSE 全链路）。纯函数测试无法覆盖这些行为。
+    // ========================================================================
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    /// 起一个只服务一次请求的 HTTP 服务器，返回 (base_url, 请求头 + 请求体)。
+    fn serve_once(
+        status: &'static str,
+        content_type: &'static str,
+        response: String,
+        extra_headers: &[(&'static str, &'static str)],
+    ) -> (String, thread::JoinHandle<(String, serde_json::Value)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let extra = extra_headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut data = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = data.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&data[..header_end + 4]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                    })
+                    .unwrap_or(0);
+                if data.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let header_end = data
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = String::from_utf8_lossy(&data[..header_end]).to_string();
+            let body: serde_json::Value = serde_json::from_slice(&data[header_end..]).unwrap();
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(response.as_bytes()).unwrap();
+            (headers, body)
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn context<'a>(base_url: &'a str, http: &'a reqwest::Client) -> CallContext<'a> {
+        CallContext {
+            http,
+            base_url,
+            api_key: "test-key",
+            model: "gpt-test",
+            timeout: Duration::from_secs(5),
+            max_retries: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_sends_bearer_and_parses_response() {
+        let body = r#"{
+            "model": "gpt-test",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "你好",
+                    "tool_calls": [{
+                        "id": "c1",
+                        "function": {"name": "echo", "arguments": "{\"a\":1}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+        }"#
+        .to_string();
+        let (base, server) = serve_once("200 OK", "application/json", body, &[]);
+
+        let http = reqwest::Client::new();
+        let messages = vec![Message::user("hi")];
+        let request = ChatRequest::new(&messages, &[]);
+        let response = OpenAiAdapter::openai()
+            .chat(&context(&base, &http), &request)
+            .await
+            .unwrap();
+
+        assert_eq!(response.content.as_deref(), Some("你好"));
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(response.usage.unwrap().total_tokens, 7);
+
+        let (headers, request_body) = server.join().unwrap();
+        let headers = headers.to_ascii_lowercase();
+        assert!(headers.contains("post /chat/completions"));
+        assert!(headers.contains("authorization: bearer test-key"));
+        assert_eq!(request_body["model"], "gpt-test");
+        assert_eq!(request_body["messages"][0]["content"], "hi");
+    }
+
+    #[tokio::test]
+    async fn chat_maps_429_with_retry_after() {
+        let (base, server) = serve_once(
+            "429 Too Many Requests",
+            "application/json",
+            r#"{"error":{"message":"slow down"}}"#.to_string(),
+            &[("Retry-After", "2")],
+        );
+
+        let http = reqwest::Client::new();
+        let messages = vec![Message::user("hi")];
+        let request = ChatRequest::new(&messages, &[]);
+        let error = OpenAiAdapter::openai()
+            .chat(&context(&base, &http), &request)
+            .await
+            .unwrap_err();
+
+        match error {
+            Error::RateLimited {
+                retry_after: Some(delay),
+                ..
+            } => assert_eq!(delay, Duration::from_secs(2)),
+            other => panic!("应当映射为 RateLimited: {other:?}"),
+        }
+        let _ = server.join();
+    }
+
+    #[tokio::test]
+    async fn chat_reports_error_field_on_success_status() {
+        // 部分兼容网关在 200 状态码下返回错误对象，不能退化成“choices 为空”。
+        let (base, server) = serve_once(
+            "200 OK",
+            "application/json",
+            r#"{"model":"m","choices":[],"error":{"message":"quota exceeded"}}"#.to_string(),
+            &[],
+        );
+
+        let http = reqwest::Client::new();
+        let messages = vec![Message::user("hi")];
+        let request = ChatRequest::new(&messages, &[]);
+        let error = OpenAiAdapter::openai()
+            .chat(&context(&base, &http), &request)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("quota exceeded"));
+        let _ = server.join();
+    }
+
+    #[tokio::test]
+    async fn stream_accumulates_text_and_tool_call_fragments() {
+        let sse = concat!(
+            r#"data: {"model":"gpt-test","choices":[{"delta":{"content":"你"}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"content":"好"}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"echo","arguments":"{\"a\":"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "\n\n",
+            r#"data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base, server) = serve_once("200 OK", "text/event-stream", sse.to_string(), &[]);
+
+        let http = reqwest::Client::new();
+        let messages = vec![Message::user("hi")];
+        let request = ChatRequest::new(&messages, &[]);
+        let mut deltas = Vec::new();
+        let response = OpenAiAdapter::openai()
+            .chat_stream(&context(&base, &http), &request, &mut |delta| {
+                match delta {
+                    StreamDelta::Text(text) => deltas.push(format!("text:{text}")),
+                    StreamDelta::Thinking(text) => deltas.push(format!("thinking:{text}")),
+                    _ => {}
+                }
+                StreamControl::Continue
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.content.as_deref(), Some("你好"));
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "c1");
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(response.finish_reason, Some(FinishReason::ToolCalls));
+        assert_eq!(response.usage.unwrap().total_tokens, 7);
+        assert_eq!(deltas, vec!["text:你", "text:好"]);
+
+        let (_, request_body) = server.join().unwrap();
+        assert_eq!(request_body["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn stream_falls_back_to_json_when_not_sse() {
+        let body = r#"{
+            "model": "gpt-test",
+            "choices": [{"message": {"role": "assistant", "content": "答案"}, "finish_reason": "stop"}]
+        }"#
+        .to_string();
+        let (base, server) = serve_once("200 OK", "application/json", body, &[]);
+
+        let http = reqwest::Client::new();
+        let messages = vec![Message::user("hi")];
+        let request = ChatRequest::new(&messages, &[]);
+        let mut deltas = Vec::new();
+        let response = OpenAiAdapter::openai()
+            .chat_stream(&context(&base, &http), &request, &mut |delta| {
+                match delta {
+                    StreamDelta::Text(text) => deltas.push(format!("text:{text}")),
+                    StreamDelta::Thinking(text) => deltas.push(format!("thinking:{text}")),
+                    _ => {}
+                }
+                StreamControl::Continue
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.content.as_deref(), Some("答案"));
+        assert!(deltas.is_empty());
+        let _ = server.join();
     }
 }

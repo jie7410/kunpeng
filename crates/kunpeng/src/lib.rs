@@ -10,6 +10,7 @@ pub use kunpeng_agents as agents;
 pub use kunpeng_anp as anp;
 pub use kunpeng_context as context;
 pub use kunpeng_core as core;
+pub use kunpeng_http as http;
 pub use kunpeng_mcp as mcp;
 pub use kunpeng_memory as memory;
 pub use kunpeng_multi as multi;

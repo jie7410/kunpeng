@@ -3,6 +3,9 @@ name = "kunpeng-rag"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 kunpeng-core.workspace = true
 kunpeng-context.workspace = true

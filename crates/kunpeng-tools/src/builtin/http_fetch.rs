@@ -1,26 +1,14 @@
 use crate::Tool;
 use async_trait::async_trait;
 use kunpeng_core::error::{Error, Result};
-use kunpeng_core::HttpErrorKind;
-
-fn http_error(error: reqwest::Error) -> Error {
-    let kind = if error.is_timeout() {
-        HttpErrorKind::Timeout
-    } else if error.is_connect() {
-        HttpErrorKind::Connect
-    } else if error.is_body() {
-        HttpErrorKind::Body
-    } else if error.is_request() {
-        HttpErrorKind::Request
-    } else {
-        HttpErrorKind::Other
-    };
-    Error::http_with_source(kind, error.to_string(), error)
-}
 use kunpeng_core::types::ToolDefinition;
+use kunpeng_http::http_error;
 use std::time::Duration;
 
 /// HTTP GET 工具。默认要求显式 host allowlist，避免模型任意访问内网。
+///
+/// 重定向在每一跳都重新校验 host：只在首个 URL 上检查 allowlist 的话，
+/// 允许列表内主机上的一个 302 就能跳到内网元数据地址（SSRF）。
 pub struct HttpFetchTool {
     client: reqwest::Client,
     allowed_hosts: Vec<String>,
@@ -34,26 +22,42 @@ impl HttpFetchTool {
                 "http_fetch 至少需要一个 allowed_hosts 条目".into(),
             ));
         }
+        let allowed_hosts: Vec<String> = allowed_hosts
+            .into_iter()
+            .map(|host| host.to_ascii_lowercase())
+            .collect();
+        let redirect_allowed = allowed_hosts.clone();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                let host = attempt.url().host_str().unwrap_or_default().to_string();
+                if host_allowed(&redirect_allowed, &host) {
+                    attempt.follow()
+                } else {
+                    attempt.error(Error::Other(format!(
+                        "http_fetch 重定向到不允许的 host: {host}"
+                    )))
+                }
+            }))
             .build()
             .map_err(http_error)?;
         Ok(Self {
             client,
-            allowed_hosts: allowed_hosts
-                .into_iter()
-                .map(|host| host.to_ascii_lowercase())
-                .collect(),
+            allowed_hosts,
             max_bytes,
         })
     }
 
     fn host_allowed(&self, host: &str) -> bool {
-        let host = host.to_ascii_lowercase();
-        self.allowed_hosts
-            .iter()
-            .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
+        host_allowed(&self.allowed_hosts, host)
     }
+}
+
+fn host_allowed(allowed_hosts: &[String], host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    allowed_hosts
+        .iter()
+        .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
 }
 
 #[async_trait]
@@ -107,6 +111,8 @@ impl Tool for HttpFetchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     #[test]
     fn allowlist_rejects_unknown_hosts() {
@@ -120,5 +126,36 @@ mod tests {
     #[test]
     fn empty_allowlist_is_rejected() {
         assert!(HttpFetchTool::new(Vec::new(), 1024).is_err());
+    }
+
+    /// 允许的主机 302 跳到未允许的 host 时，重定向策略必须拒绝。
+    #[tokio::test]
+    async fn redirect_to_unallowed_host_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let head = "HTTP/1.1 302 Found\r\nLocation: http://192.0.2.1/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes());
+        });
+
+        // 首跳 127.0.0.1 在允许列表内；重定向目标是未允许的网段地址。
+        let tool = HttpFetchTool::new(vec!["127.0.0.1".into()], 1024).unwrap();
+        let error = tool
+            .call(serde_json::json!({ "url": format!("http://{address}/hop") }))
+            .await
+            .unwrap_err();
+        // 自定义原因在 reqwest 重定向错误的 source 链里，逐层收集再断言。
+        let mut chain = String::new();
+        let mut current: Option<&dyn std::error::Error> = Some(&error);
+        while let Some(err) = current {
+            chain.push_str(&err.to_string());
+            chain.push_str(" | ");
+            current = err.source();
+        }
+        assert!(chain.contains("重定向"), "got: {chain}");
+        let _ = server.join();
     }
 }

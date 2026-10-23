@@ -3,6 +3,9 @@ name = "kunpeng-memory"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 kunpeng-core.workspace = true
 serde.workspace = true

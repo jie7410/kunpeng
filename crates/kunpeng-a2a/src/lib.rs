@@ -6,29 +6,16 @@
 //! 结构自行投影。
 //!
 //! 适配器只依赖 `kunpeng-multi` 的信封和 `kunpeng-core` 的错误类型，不依赖
-//! Agent 实现或 runtime。
+//! Agent 实现或 runtime。SSE 解码和 reqwest 错误映射复用 `kunpeng-http`。
 
 use async_trait::async_trait;
-use kunpeng_core::{Error, HttpErrorKind, Result, StreamControl};
-
-fn http_error(error: reqwest::Error) -> Error {
-    let kind = if error.is_timeout() {
-        HttpErrorKind::Timeout
-    } else if error.is_connect() {
-        HttpErrorKind::Connect
-    } else if error.is_body() {
-        HttpErrorKind::Body
-    } else if error.is_request() {
-        HttpErrorKind::Request
-    } else {
-        HttpErrorKind::Other
-    };
-    Error::http_with_source(kind, error.to_string(), error)
-}
+use kunpeng_core::{Error, Result, StreamControl};
+use kunpeng_http::{consume_sse, http_error, is_event_stream};
 use kunpeng_multi::{AgentEnvelope, AgentId, AgentPayload, AgentProtocol};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// A2A Agent Card 的最小结构化视图；未知字段保留在 `extra`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,12 +100,18 @@ impl PushNotificationConfig {
 }
 
 /// A2A 同步/流式客户端。一个实例对应一个远端 endpoint。
+///
+/// 所有请求都有超时：非流式请求是整次往返的上限，流式请求限制“到响应头为止”
+/// 加上相邻 SSE chunk 的空闲间隔——长任务的事件流可以跑很久，不能设总时长。
 #[derive(Clone)]
 pub struct A2aClient {
     http: reqwest::Client,
     endpoint: String,
     agent_id: AgentId,
+    timeout: Duration,
 }
+
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl A2aClient {
     pub fn new(endpoint: impl Into<String>, agent_id: impl Into<AgentId>) -> Self {
@@ -126,6 +119,7 @@ impl A2aClient {
             http: reqwest::Client::new(),
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
             agent_id: agent_id.into(),
+            timeout: DEFAULT_TIMEOUT,
         }
     }
 
@@ -138,7 +132,14 @@ impl A2aClient {
             http,
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
             agent_id: agent_id.into(),
+            timeout: DEFAULT_TIMEOUT,
         }
+    }
+
+    /// 覆盖默认的 120 秒等待上限（慢网关或长轮询场景）。
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     pub fn endpoint(&self) -> &str {
@@ -147,15 +148,24 @@ impl A2aClient {
 
     pub async fn agent_card(&self) -> Result<AgentCard> {
         let url = format!("{}/.well-known/agent.json", self.endpoint);
-        let response = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(http_error)?
-            .error_for_status()
-            .map_err(http_error)?;
-        response.json::<AgentCard>().await.map_err(http_error)
+        let card = match tokio::time::timeout(self.timeout, async {
+            self.http
+                .get(url)
+                .send()
+                .await
+                .map_err(http_error)?
+                .error_for_status()
+                .map_err(http_error)?
+                .json::<AgentCard>()
+                .await
+                .map_err(http_error)
+        })
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => return Err(Error::timeout("A2A Agent Card 获取", self.timeout)),
+        };
+        Ok(card)
     }
 
     /// 发送一条文本消息。`context_id` 用于把多轮消息归到同一个 A2A context。
@@ -291,87 +301,66 @@ impl A2aClient {
     where
         F: FnMut(&Value) -> StreamControl + Send,
     {
-        let response = self
-            .http
-            .post(&self.endpoint)
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .json(&request)
-            .send()
-            .await
-            .map_err(http_error)?
-            .error_for_status()
-            .map_err(http_error)?;
+        let response = match tokio::time::timeout(self.timeout, async {
+            self.http
+                .post(&self.endpoint)
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .json(&request)
+                .send()
+                .await
+                .map_err(http_error)?
+                .error_for_status()
+                .map_err(http_error)
+        })
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => return Err(Error::timeout("A2A 请求", self.timeout)),
+        };
 
         if !is_event_stream(&response) {
-            let body: Value = response.json().await.map_err(http_error)?;
+            let body: Value =
+                match tokio::time::timeout(self.timeout, response.json::<Value>()).await {
+                    Ok(result) => result.map_err(http_error)?,
+                    Err(_) => return Err(Error::timeout("A2A 响应读取", self.timeout)),
+                };
             return rpc_result(body);
         }
 
-        let mut decoder = SseDecoder::default();
+        // 空闲超时交给 consume_sse；总时长不设上限，长任务的事件流可以跑很久。
         let mut last = None;
-        let mut response = response;
-        while let Some(chunk) = response.chunk().await.map_err(http_error)? {
-            for data in decoder.push(&chunk) {
-                if data == "[DONE]" {
-                    continue;
-                }
-                let event: Value = serde_json::from_str(&data)
-                    .map_err(|error| Error::Other(format!("A2A SSE 事件不是 JSON: {error}")))?;
-                if let Some(error) = event.get("error") {
-                    let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
-                    let message = error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("未知错误");
-                    return Err(Error::Other(format!(
-                        "A2A 流式请求失败（{code}）: {message}"
-                    )));
-                }
-                if let Some(result) = event.get("result").cloned() {
-                    if on_event(&result) == StreamControl::Stop {
-                        return Err(Error::Cancelled);
-                    }
-                    last = Some(result);
-                }
+        consume_sse(response, self.timeout, |event| {
+            if event.data.trim() == "[DONE]" {
+                return Ok(());
             }
-        }
-        for data in decoder.finish() {
-            if data == "[DONE]" {
-                continue;
-            }
-            let event: Value = serde_json::from_str(&data)
+            let value: Value = serde_json::from_str(&event.data)
                 .map_err(|error| Error::Other(format!("A2A SSE 事件不是 JSON: {error}")))?;
-            if let Some(error) = event.get("error") {
-                let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
-                let message = error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("未知错误");
-                return Err(Error::Other(format!(
-                    "A2A 流式请求失败（{code}）: {message}"
-                )));
-            }
-            if let Some(result) = event.get("result").cloned() {
-                if on_event(&result) == StreamControl::Stop {
-                    return Err(Error::Cancelled);
-                }
-                last = Some(result);
-            }
-        }
+            handle_stream_event(value, on_event, &mut last)
+        })
+        .await?;
+
         last.ok_or_else(|| Error::Other("A2A 流式响应没有 result 事件".into()))
     }
 
     async fn post_rpc(&self, request: Value) -> Result<Value> {
-        let response = self
-            .http
-            .post(&self.endpoint)
-            .json(&request)
-            .send()
-            .await
-            .map_err(http_error)?
-            .error_for_status()
-            .map_err(http_error)?;
-        let body: Value = response.json().await.map_err(http_error)?;
+        let body = match tokio::time::timeout(self.timeout, async {
+            self.http
+                .post(&self.endpoint)
+                .json(&request)
+                .send()
+                .await
+                .map_err(http_error)?
+                .error_for_status()
+                .map_err(http_error)?
+                .json::<Value>()
+                .await
+                .map_err(http_error)
+        })
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => return Err(Error::timeout("A2A 请求", self.timeout)),
+        };
         rpc_result(body)
     }
 
@@ -498,89 +487,45 @@ fn collect_parts(value: &Value, texts: &mut Vec<String>) {
 
 fn rpc_result(body: Value) -> Result<Value> {
     if let Some(error) = body.get("error") {
-        let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("未知错误");
-        return Err(Error::Other(format!("A2A 请求失败（{code}）: {message}")));
+        return Err(Error::Rpc {
+            protocol: "A2A",
+            code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("未知错误")
+                .to_string(),
+        });
     }
     body.get("result")
         .cloned()
         .ok_or_else(|| Error::Other("A2A 响应缺少 result".into()))
 }
 
-fn is_event_stream(response: &reqwest::Response) -> bool {
-    response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
-        .unwrap_or(true)
-}
-
-#[derive(Default)]
-struct SseDecoder {
-    buffer: Vec<u8>,
-    data: String,
-}
-
-impl SseDecoder {
-    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.buffer.extend_from_slice(chunk);
-        let mut events = Vec::new();
-        while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let mut line: Vec<u8> = self.buffer.drain(..=index).collect();
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            self.line(&String::from_utf8_lossy(&line), &mut events);
-        }
-        events
+/// 处理一条流式事件：错误帧转 `Error::Rpc`，result 帧交给回调并记录最后一个。
+/// 抽成函数让 chunk 循环和 finish 冲洗共用同一份逻辑。
+fn handle_stream_event<F>(value: Value, on_event: &mut F, last: &mut Option<Value>) -> Result<()>
+where
+    F: FnMut(&Value) -> StreamControl + Send,
+{
+    if let Some(error) = value.get("error") {
+        return Err(Error::Rpc {
+            protocol: "A2A",
+            code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("未知错误")
+                .to_string(),
+        });
     }
-
-    fn finish(&mut self) -> Vec<String> {
-        let mut events = Vec::new();
-        if !self.buffer.is_empty() {
-            let mut line = std::mem::take(&mut self.buffer);
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            self.line(&String::from_utf8_lossy(&line), &mut events);
+    if let Some(result) = value.get("result").cloned() {
+        if on_event(&result) == StreamControl::Stop {
+            return Err(Error::Cancelled);
         }
-        if let Some(event) = self.dispatch() {
-            events.push(event);
-        }
-        events
+        *last = Some(result);
     }
-
-    fn line(&mut self, line: &str, events: &mut Vec<String>) {
-        if line.is_empty() {
-            if let Some(event) = self.dispatch() {
-                events.push(event);
-            }
-            return;
-        }
-        if line.starts_with(':') {
-            return;
-        }
-        if let Some(value) = line.strip_prefix("data:") {
-            let value = value.strip_prefix(' ').unwrap_or(value);
-            if !self.data.is_empty() {
-                self.data.push('\n');
-            }
-            self.data.push_str(value);
-        }
-    }
-
-    fn dispatch(&mut self) -> Option<String> {
-        if self.data.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut self.data))
-        }
-    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -97,6 +97,13 @@ pub enum Error {
         retry_after: Option<Duration>,
         body: String,
     },
+    /// JSON-RPC 协议错误响应（MCP、A2A）。`code` 保留协议错误码，调用方可以
+    /// 编程式区分 method not found、无效参数等，而不必解析错误字符串。
+    Rpc {
+        protocol: &'static str,
+        code: i64,
+        message: String,
+    },
     /// 本地文件/进程等 IO 失败。
     Io(std::io::Error),
     /// 通用 JSON 序列化/反序列化错误；不假设一定是 provider 响应。
@@ -164,6 +171,18 @@ impl Error {
             }
         }
     }
+
+    /// 构造各等待阶段（响应头、body、流式 chunk、JSON-RPC 响应）的超时错误。
+    ///
+    /// 超时按“阶段”而不是“整次请求”施加：一次长流式生成可以合法地超过任何
+    /// 总上限，只有某一阶段停滞才应该被判定为挂起。阶段名进入错误消息，
+    /// 例如 “响应头”、“SSE 流式数据”。
+    pub fn timeout(stage: &str, timeout: Duration) -> Self {
+        Self::http(
+            HttpErrorKind::Timeout,
+            format!("{stage}超时（{timeout:?}）"),
+        )
+    }
 }
 
 impl fmt::Display for Error {
@@ -199,6 +218,11 @@ impl fmt::Display for Error {
                 ),
                 None => write!(f, "{provider} 触发限流（429）: {body}"),
             },
+            Error::Rpc {
+                protocol,
+                code,
+                message,
+            } => write!(f, "{protocol} JSON-RPC 错误（{code}）: {message}"),
             Error::Io(error) => write!(f, "IO 失败: {error}"),
             Error::Json(error) => write!(f, "JSON 序列化/解析失败: {error}"),
             Error::ParseResponse(error) => write!(
@@ -306,5 +330,29 @@ mod tests {
     #[test]
     fn error_enum_stays_small() {
         assert!(std::mem::size_of::<Error>() <= 64);
+    }
+
+    #[test]
+    fn rpc_errors_carry_protocol_and_code() {
+        let error = Error::Rpc {
+            protocol: "MCP",
+            code: -32601,
+            message: "method not found".into(),
+        };
+        assert!(error.to_string().contains("-32601"));
+        assert!(error.to_string().contains("method not found"));
+    }
+
+    #[test]
+    fn timeout_error_names_the_stage() {
+        let error = Error::timeout("响应头", Duration::from_secs(120));
+        assert!(matches!(
+            error,
+            Error::Http {
+                kind: HttpErrorKind::Timeout,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("响应头"));
     }
 }

@@ -3,6 +3,9 @@ name = "kunpeng-mcp"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 kunpeng-core.workspace = true
 kunpeng-tools.workspace = true

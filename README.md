@@ -105,7 +105,7 @@ cargo run --example basic_agent
 | `LLM_API_KEY` | 是 | - | API key |
 | `LLM_BASE_URL` | 否 | 按 provider 决定 | 覆盖默认地址 |
 | `LLM_MODEL` | 否 | 按 provider 决定 | 覆盖默认模型 |
-| `LLM_TIMEOUT_SECS` | 否 | `120` | 单次 HTTP 请求总超时，必须大于 0 |
+| `LLM_TIMEOUT_SECS` | 否 | `120` | 单次尝试各阶段（等待响应头/读非流式 body/流式相邻 chunk）的超时上限，必须大于 0 |
 | `LLM_MAX_RETRIES` | 否 | `2` | 重试次数，上限 10 |
 
 ### Provider 别名与默认值
@@ -170,6 +170,7 @@ let model = LlmConfig::new("openai", "sk-...").build(&registry)?;
 | `Http { kind, message, source }` | 传输失败；`kind` 区分超时/连接/请求/响应体 |
 | `Api { provider, status, body }` | 非 429 的服务端错误 |
 | `RateLimited { provider, retry_after, body }` | 429 限流，可读取建议等待时间 |
+| `Rpc { protocol, code, message }` | MCP / A2A 的 JSON-RPC 错误响应，保留协议错误码 |
 | `Json` | 通用 serde JSON 错误 |
 | `ParseResponse(Box<_>)` | 带 provider/body 上下文的响应解析失败 |
 | `InvalidToolArguments(Box<_>)` | 工具参数 JSON 错误 |

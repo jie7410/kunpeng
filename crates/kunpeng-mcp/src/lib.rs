@@ -20,6 +20,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -30,6 +31,10 @@ use tokio::{
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const CLIENT_NAME: &str = "kunpeng";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// 单个 JSON-RPC 请求的默认等待上限。经 Agent 调用工具时，`RunConfig` 的
+/// tool_timeout（默认更短）通常先触发；这里是防止 server 挂起时永久阻塞的兜底。
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// server 发起的 JSON-RPC 请求（例如 sampling/createMessage）。
 ///
@@ -106,6 +111,7 @@ pub struct McpClient {
     transport: Arc<dyn McpTransport>,
     inbound: Arc<dyn InboundHandler>,
     next_id: AtomicU64,
+    timeout: Duration,
 }
 
 impl McpClient {
@@ -114,6 +120,7 @@ impl McpClient {
             transport,
             inbound: Arc::new(NoopInbound),
             next_id: AtomicU64::new(1),
+            timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
 
@@ -126,6 +133,13 @@ impl McpClient {
     /// 注册 sampling/createMessage 处理器，并让 initialize 声明 sampling 能力。
     pub fn with_sampling_handler(mut self, handler: Arc<dyn SamplingHandler>) -> Self {
         self.inbound = Arc::new(SamplingInbound { handler });
+        self
+    }
+
+    /// 覆盖单个 JSON-RPC 请求的等待上限（默认 120 秒）。挂起而不是报错的
+    /// server 会被超时中断；慢工具应该调大这里或 Agent 的 tool_timeout。
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -302,20 +316,27 @@ impl McpClient {
             "method": method,
             "params": params
         });
-        let response = self
-            .transport
-            .request(request, self.inbound.as_ref())
-            .await?;
+        // server 挂起时不让调用方永久等待；initialize/list/call 都受此保护。
+        let response = match tokio::time::timeout(
+            self.timeout,
+            self.transport.request(request, self.inbound.as_ref()),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => return Err(Error::timeout(&format!("MCP {method} 请求"), self.timeout)),
+        };
 
         if let Some(error) = response.get("error") {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("未知错误");
-            let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
-            return Err(Error::Other(format!(
-                "MCP {method} 失败（{code}）: {message}"
-            )));
+            return Err(Error::Rpc {
+                protocol: "MCP",
+                code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
+                message: error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("未知错误")
+                    .to_string(),
+            });
         }
 
         response
@@ -661,6 +682,12 @@ impl StdioTransport {
 
 #[async_trait]
 impl McpTransport for StdioTransport {
+    /// 串行执行一次 JSON-RPC 请求：整个请求周期持有传输锁，读到 id 匹配的
+    /// 响应为止，期间其他请求排队（stdio 也没有并发出多条请求的意义）。
+    ///
+    /// 注意：`inbound` 在锁内被调用。handler 不得反过来调用同一个 `McpClient`
+    /// ——那会等待自己持有的锁，直接死锁。sampling handler 通常走独立 HTTP，
+    /// 不受影响；需要回调 MCP 的 handler 应该使用单独的连接。
     async fn request(&self, request: Value, inbound: &dyn InboundHandler) -> Result<Value> {
         let id = request.get("id").cloned();
         let mut line = serde_json::to_string(&request)?;

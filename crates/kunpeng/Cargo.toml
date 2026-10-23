@@ -3,8 +3,12 @@ name = "kunpeng"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 kunpeng-core.workspace = true
+kunpeng-http.workspace = true
 kunpeng-provider.workspace = true
 kunpeng-adapter-openai.workspace = true
 kunpeng-adapter-anthropic.workspace = true

@@ -49,7 +49,7 @@
 
 - `adapter_openai` 的 wire types：`OpenAiRequest`、`OpenAiMessage`、`OpenAiContent`、`OpenAiTool`、`OpenAiResponse`、`OpenAiStreamResponse`、`OpenAiUsage` 等
 - `adapter_anthropic` 的 wire types：`AnthropicRequest`、`AnthropicReqMessage`、`AnthropicReqBlock`、`AnthropicResponse`、`AnthropicStreamEvent`、`AnthropicUsage` 等
-- `provider::adapter` 的 SSE 解码器与内部 HTTP 工具
+- `kunpeng-http` 的 SSE 解码器与 HTTP 工具（`provider::adapter` re-export）
 - `ProviderData` 中的 provider 原始 JSON
 
 这些 wire types 是私有实现，新增/修改字段不遵循 core 的 `#[non_exhaustive]`

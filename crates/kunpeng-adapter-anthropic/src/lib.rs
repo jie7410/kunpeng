@@ -21,7 +21,7 @@ use kunpeng_core::types::{
     ProviderData, ServerToolUse, StreamControl, StreamDelta, ToolCall, ToolChoice, Usage,
 };
 use kunpeng_provider::adapter::{
-    api_error, consume_sse, http_error, is_event_stream, parse_response, retry_after,
+    api_error, consume_sse, is_event_stream, parse_response, read_body, retry_after,
     send_with_retry, truncate, Adapter, CallContext,
 };
 use serde::{Deserialize, Serialize};
@@ -58,8 +58,9 @@ impl Adapter for AnthropicAdapter {
         let body = build_body(ctx.model, req, false)?;
 
         // base_url 可能已经带 /v1（很多代理会这样配），messages_url 负责去重。
-        // 重试闭包每次重新序列化 body。
-        let response = send_with_retry(ctx.max_retries, || {
+        // 重试闭包每次重新序列化 body；timeout 只覆盖“到响应头为止”，
+        // body 读取由 read_body 单独限时。
+        let response = send_with_retry(ctx.max_retries, ctx.timeout, || {
             ctx.http
                 .post(messages_url(ctx.base_url))
                 .header("x-api-key", ctx.api_key)
@@ -71,11 +72,11 @@ impl Adapter for AnthropicAdapter {
         let status = response.status();
         if !status.is_success() {
             let retry_after = retry_after(response.headers());
-            let body = response.text().await.unwrap_or_default();
+            let body = read_body(response, ctx.timeout).await.unwrap_or_default();
             return Err(api_error("anthropic", status, body, retry_after));
         }
 
-        let raw = response.text().await.map_err(http_error)?;
+        let raw = read_body(response, ctx.timeout).await?;
         let parsed: AnthropicResponse = parse_response("anthropic", &raw)?;
         Ok(into_chat_response(parsed, ctx.model))
     }
@@ -93,7 +94,7 @@ impl Adapter for AnthropicAdapter {
         on_delta: &mut (dyn for<'a> FnMut(StreamDelta<'a>) -> StreamControl + Send),
     ) -> Result<ChatResponse> {
         let body = build_body(ctx.model, req, true)?;
-        let response = send_with_retry(ctx.max_retries, || {
+        let response = send_with_retry(ctx.max_retries, ctx.timeout, || {
             ctx.http
                 .post(messages_url(ctx.base_url))
                 .header("x-api-key", ctx.api_key)
@@ -105,13 +106,13 @@ impl Adapter for AnthropicAdapter {
         let status = response.status();
         if !status.is_success() {
             let retry_after = retry_after(response.headers());
-            let body = response.text().await.unwrap_or_default();
+            let body = read_body(response, ctx.timeout).await.unwrap_or_default();
             return Err(api_error("anthropic", status, body, retry_after));
         }
 
         // 代理/兼容端点可能忽略 stream=true，返回普通 JSON。
         if !is_event_stream(&response) {
-            let raw = response.text().await.map_err(http_error)?;
+            let raw = read_body(response, ctx.timeout).await?;
             let parsed: AnthropicResponse = parse_response("anthropic", &raw)?;
             return Ok(into_chat_response(parsed, ctx.model));
         }
@@ -123,7 +124,7 @@ impl Adapter for AnthropicAdapter {
         let mut blocks: BTreeMap<usize, StreamBlock> = BTreeMap::new();
         let mut done = false;
 
-        consume_sse(response, |event| {
+        consume_sse(response, ctx.timeout, |event| {
             if done || event.data.is_empty() {
                 return Ok(());
             }
@@ -1366,5 +1367,214 @@ mod tests {
         assert_eq!(value["tool_choice"]["type"], "any");
         assert_eq!(value["stop_sequences"][0], "END");
         assert_eq!(value["top_k"], 5);
+    }
+
+    // ========================================================================
+    // wire 级测试：用本地 TCP 服务器覆盖完整的 HTTP 请求路径（URL、鉴权头、
+    // 错误码映射、SSE 全链路）。纯函数测试无法覆盖这些行为。
+    // ========================================================================
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    /// 起一个只服务一次请求的 HTTP 服务器，返回 (base_url, 请求头 + 请求体)。
+    fn serve_once(
+        status: &'static str,
+        content_type: &'static str,
+        response: String,
+    ) -> (String, thread::JoinHandle<(String, serde_json::Value)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut data = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = data.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&data[..header_end + 4]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                    })
+                    .unwrap_or(0);
+                if data.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let header_end = data
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = String::from_utf8_lossy(&data[..header_end]).to_string();
+            let body: serde_json::Value = serde_json::from_slice(&data[header_end..]).unwrap();
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(response.as_bytes()).unwrap();
+            (headers, body)
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn context<'a>(base_url: &'a str, http: &'a reqwest::Client) -> CallContext<'a> {
+        CallContext {
+            http,
+            base_url,
+            api_key: "test-key",
+            model: "claude-test",
+            timeout: Duration::from_secs(5),
+            max_retries: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_sends_headers_and_maps_blocks() {
+        let body = r#"{
+            "model": "claude-test",
+            "content": [
+                {"type": "thinking", "thinking": "先想一想", "signature": "sig-1"},
+                {"type": "text", "text": "答案"},
+                {"type": "tool_use", "id": "t-1", "name": "echo", "input": {"a": 1}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#
+        .to_string();
+        let (base, server) = serve_once("200 OK", "application/json", body);
+
+        let http = reqwest::Client::new();
+        let messages = vec![Message::user("hi")];
+        let request = ChatRequest::new(&messages, &[]);
+        let response = AnthropicAdapter::new()
+            .chat(&context(&base, &http), &request)
+            .await
+            .unwrap();
+
+        assert_eq!(response.thinking.as_deref(), Some("先想一想"));
+        assert_eq!(response.content.as_deref(), Some("答案"));
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "t-1");
+        assert_eq!(response.finish_reason, Some(FinishReason::ToolCalls));
+        let usage = response.usage.unwrap();
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (10, 5));
+        let data = response.provider_data.expect("原始 block 应被保留");
+        assert_eq!(data.data[0]["signature"], "sig-1");
+
+        let (headers, request_body) = server.join().unwrap();
+        let headers = headers.to_ascii_lowercase();
+        assert!(headers.contains("post /v1/messages"));
+        assert!(headers.contains("x-api-key: test-key"));
+        assert!(headers.contains("anthropic-version: 2023-06-01"));
+        assert_eq!(request_body["model"], "claude-test");
+        assert_eq!(request_body["messages"][0]["content"][0]["text"], "hi");
+    }
+
+    #[tokio::test]
+    async fn chat_maps_5xx_to_api_error() {
+        let (base, server) = serve_once(
+            "500 Internal Server Error",
+            "application/json",
+            r#"{"type":"error","error":{"message":"boom"}}"#.to_string(),
+        );
+
+        let http = reqwest::Client::new();
+        let messages = vec![Message::user("hi")];
+        let request = ChatRequest::new(&messages, &[]);
+        let error = AnthropicAdapter::new()
+            .chat(&context(&base, &http), &request)
+            .await
+            .unwrap_err();
+
+        match error {
+            Error::Api { status, .. } => assert_eq!(status, 500),
+            other => panic!("应当映射为 Api: {other:?}"),
+        }
+        let _ = server.join();
+    }
+
+    #[tokio::test]
+    async fn stream_replays_thinking_and_accumulates_tool_input() {
+        let sse = concat!(
+            r#"data: {"type":"message_start","message":{"model":"claude-test","usage":{"input_tokens":10}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"想"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"一想"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-1"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"答案"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t-1","name":"echo","input":{}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"a\":"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"1}"}}"#,
+            "\n\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}"#,
+            "\n\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        );
+        let (base, server) = serve_once("200 OK", "text/event-stream", sse.to_string());
+
+        let http = reqwest::Client::new();
+        let messages = vec![Message::user("hi")];
+        let request = ChatRequest::new(&messages, &[]);
+        let mut deltas = Vec::new();
+        let response = AnthropicAdapter::new()
+            .chat_stream(&context(&base, &http), &request, &mut |delta| {
+                match delta {
+                    StreamDelta::Text(text) => deltas.push(format!("text:{text}")),
+                    StreamDelta::Thinking(text) => deltas.push(format!("thinking:{text}")),
+                    _ => {}
+                }
+                StreamControl::Continue
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(deltas, vec!["thinking:想", "thinking:一想", "text:答案"]);
+        assert_eq!(response.thinking.as_deref(), Some("想一想"));
+        assert_eq!(response.content.as_deref(), Some("答案"));
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(response.finish_reason, Some(FinishReason::ToolCalls));
+        let usage = response.usage.unwrap();
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (10, 5));
+        // signature 必须进入原始 block，下一轮请求才能原样回放。
+        let data = response.provider_data.expect("原始 block 应被保留");
+        assert_eq!(data.data[0]["type"], "thinking");
+        assert_eq!(data.data[0]["signature"], "sig-1");
+        assert_eq!(data.data[2]["type"], "tool_use");
+        assert_eq!(data.data[2]["input"]["a"], 1);
+
+        let (_, request_body) = server.join().unwrap();
+        assert_eq!(request_body["stream"], true);
     }
 }

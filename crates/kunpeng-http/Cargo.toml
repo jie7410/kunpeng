@@ -1,0 +1,12 @@
+[package]
+name = "kunpeng-http"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kunpeng-core.workspace = true
+reqwest.workspace = true
+tokio.workspace = true

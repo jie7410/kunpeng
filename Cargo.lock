@@ -429,6 +429,7 @@ dependencies = [
  "kunpeng-anp",
  "kunpeng-context",
  "kunpeng-core",
+ "kunpeng-http",
  "kunpeng-mcp",
  "kunpeng-memory",
  "kunpeng-multi",
@@ -444,6 +445,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "kunpeng-core",
+ "kunpeng-http",
  "kunpeng-multi",
  "reqwest",
  "serde",
@@ -461,6 +463,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -473,6 +476,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -496,6 +500,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "kunpeng-core",
+ "kunpeng-http",
  "kunpeng-multi",
  "reqwest",
  "serde",
@@ -531,6 +536,15 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "kunpeng-http"
+version = "0.1.0"
+dependencies = [
+ "kunpeng-core",
+ "reqwest",
  "tokio",
 ]
 
@@ -575,6 +589,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "kunpeng-core",
+ "kunpeng-http",
  "reqwest",
  "serde",
  "serde_json",
@@ -610,6 +625,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "kunpeng-core",
+ "kunpeng-http",
  "reqwest",
  "serde_json",
  "tokio",

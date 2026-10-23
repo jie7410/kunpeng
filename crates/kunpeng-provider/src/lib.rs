@@ -17,10 +17,11 @@ mod provider;
 mod registry;
 
 pub use adapter::{
-    api_error, consume_sse, http_error, is_event_stream, parse_response, send_with_retry, truncate,
-    Adapter, CallContext, SseEvent,
+    api_error, consume_sse, http_error, is_event_stream, parse_response, read_body,
+    send_with_retry, truncate, Adapter, CallContext,
 };
 pub use config::LlmConfig;
+pub use kunpeng_http::SseEvent;
 pub use model::{Model, ModelDefault};
 pub use provider::Provider;
 pub use registry::AdapterRegistry;

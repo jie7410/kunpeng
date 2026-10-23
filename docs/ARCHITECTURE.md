@@ -72,7 +72,8 @@ AdapterRegistry 按名称/别名选择 Adapter；core 不认识厂商。
 | 模型抽象 | `crates/kunpeng-core/src/chat_model.rs` | `ChatModel` trait | 不包含 HTTP/厂商协议 |
 | 模型绑定 | `crates/kunpeng-provider/src/model.rs` | `Model`、模型名、默认参数 | 不持有会话历史 |
 | 连接 | `crates/kunpeng-provider/src/provider.rs` | HTTP Client、URL 校验、重试 | 不解析具体协议 |
-| 适配器 API | `crates/kunpeng-provider/src/adapter.rs` | `Adapter`、SSE、重试/截断 | 不知道业务 |
+| 适配器 API | `crates/kunpeng-provider/src/adapter.rs` | `Adapter`、重试/截断/响应解析 | 不知道业务 |
+| 通用 HTTP | `crates/kunpeng-http/src/lib.rs` | reqwest 错误映射、SSE 解码、限时 body 读取 | 不认识 provider、Agent 或协议 |
 | 适配器注册 | `crates/kunpeng-provider/src/registry.rs` | 名称/别名 -> Adapter | 不绑定厂商 |
 | 协议适配 | `crates/kunpeng-adapter-openai/`、`kunpeng-adapter-anthropic/` | 统一消息 ↔ 各家 JSON | 不管理工具循环 |
 | 语义类型 | `crates/kunpeng-core/src/types.rs` | `Message`、`ChatRequest`、`ChatResponse`、`ToolCall` | 不依赖网络和 UI |
@@ -92,11 +93,13 @@ crates/
 │   ├── src/error.rs             统一错误类型
 │   └── src/chat_model.rs        ChatModel trait
 ├── kunpeng-provider/
-│   ├── src/adapter.rs           Adapter API、SSE、重试/解析/截断
+│   ├── src/adapter.rs           Adapter API、重试/解析/截断（re-export kunpeng-http）
 │   ├── src/registry.rs          AdapterRegistry
 │   ├── src/provider.rs          Provider：HTTP Client、base_url、API key、重试
 │   ├── src/model.rs             Model：模型名 + 默认参数
 │   └── src/config.rs            LlmConfig + 适配器解析
+├── kunpeng-http/
+│   └── src/lib.rs               http_error、SseDecoder/consume_sse、read_body
 ├── kunpeng-adapter-openai/
 │   └── src/lib.rs               OpenAI Chat Completions Adapter
 ├── kunpeng-adapter-anthropic/
@@ -280,7 +283,7 @@ Deny(reason) → 不执行，写入 is_error 的 tool_result
 
 `send_with_retry` 对 408/429/5xx 做指数退避，并优先使用 `Retry-After`。
 
-放在 `provider/src/adapter.rs` 而不是两个适配器里，避免 OpenAI 和 Anthropic 各写一套。注意它是**按单次尝试**计算 timeout 的，总耗时可能约为 `timeout × (重试次数 + 1)`。
+放在 `provider/src/adapter.rs` 而不是两个适配器里，避免 OpenAI 和 Anthropic 各写一套。超时按**阶段**而不是整次请求施加：`send_with_retry` 限制单次尝试到响应头为止，非流式 body 读取由 `read_body` 限时，流式由 `consume_sse` 的空闲超时兜底——一次长流式生成可以合法超过任何总上限，只有某一阶段停滞才应中断。最坏总耗时约为 `timeout × (重试次数 + 1)`。
 
 ### 6. 工具顺序固定
 
@@ -317,7 +320,7 @@ Tauri 可以直接把事件 `emit` 给前端；CLI 直接打印；测试收集�
 
 两个适配器各自处理 SSE：
 
-- 共用 `SseDecoder`：跨 chunk 缓冲、按行解析、处理 CRLF/多行 `data:`；
+- 共用 `kunpeng-http` 的 `SseDecoder`：跨 chunk 缓冲、按行解析、处理 CRLF/多行 `data:`，相邻 chunk 之间的空闲等待有上限；
 - OpenAI：按 `tool_calls[].index` 累积 id/name/arguments 分片，`[DONE]` 结束；
 - Anthropic：文本走 `text_delta`，思考走 `thinking_delta`/`signature_delta`，工具参数走 `input_json_delta`，按 content block index 累积；
 - 最终都组装成同一个 `ChatResponse`，Agent 的工具循环与非流式完全一致。

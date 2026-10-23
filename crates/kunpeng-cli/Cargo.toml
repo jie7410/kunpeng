@@ -12,6 +12,9 @@ doc = false
 name = "kunpeng_cli"
 path = "src/lib.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 kunpeng = { path = "../kunpeng" }
 tokio.workspace = true

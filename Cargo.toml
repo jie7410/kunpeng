@@ -16,6 +16,7 @@ async-trait = "0.1"
 anyhow = "1"
 
 kunpeng-core = { path = "crates/kunpeng-core" }
+kunpeng-http = { path = "crates/kunpeng-http" }
 kunpeng-provider = { path = "crates/kunpeng-provider" }
 kunpeng-adapter-openai = { path = "crates/kunpeng-adapter-openai" }
 kunpeng-adapter-anthropic = { path = "crates/kunpeng-adapter-anthropic" }
@@ -29,6 +30,10 @@ kunpeng-rag = { path = "crates/kunpeng-rag" }
 kunpeng-mcp = { path = "crates/kunpeng-mcp" }
 kunpeng-a2a = { path = "crates/kunpeng-a2a" }
 kunpeng-anp = { path = "crates/kunpeng-anp" }
+
+[workspace.lints.rust]
+# 全库不使用 unsafe；新增 crate 自动继承，无需逐文件声明。
+unsafe_code = "deny"
 
 [profile.release]
 lto = true

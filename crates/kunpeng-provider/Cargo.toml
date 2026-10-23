@@ -3,8 +3,12 @@ name = "kunpeng-provider"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 kunpeng-core.workspace = true
+kunpeng-http.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 serde.workspace = true

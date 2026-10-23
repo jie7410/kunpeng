@@ -10,19 +10,25 @@ use std::{sync::Arc, time::Duration};
 
 pub struct Provider {
     /// 复用一个 Client，连接池和 TLS 会话才能跨请求复用。
+    ///
+    /// Client 上不设总超时：reqwest 的 Client 级超时覆盖整个响应体读取，会误杀
+    /// 长流式生成。各阶段超时由适配器按 `ctx.timeout` 施加。
     http: reqwest::Client,
     /// 已去掉尾部 `/`，协议层直接拼路径。
     base_url: String,
     api_key: String,
     adapter: Arc<dyn Adapter>,
+    timeout: Duration,
     max_retries: u32,
 }
 
 impl Provider {
     /// 构造时做完全部静态校验，避免请求发出后才发现 URL 或 timeout 不合法。
     ///
-    /// `timeout_secs` 是整次 HTTP 请求的上限（连接 + 发送 + 读完 body），不是空闲
-    /// 超时。流式响应如果以后要接，需要单独的 idle timeout，不能直接复用这个值。
+    /// `timeout_secs` 是单次尝试各等待阶段的上限：等待响应头（含建连）、读取
+    /// 非流式 body、流式响应相邻 chunk 的间隔。它不是整次请求的总时长——
+    /// 一次长流式生成可以合法地超过任何总上限；非流式最坏耗时约为两个阶段
+    /// 之和（响应头 + body），重试再按次数放大。
     pub fn new(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
@@ -40,10 +46,7 @@ impl Provider {
         reqwest::Url::parse(&base_url)
             .map_err(|e| Error::InvalidConfig(format!("base_url 无效: {e}")))?;
 
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(http_error)?;
+        let http = reqwest::Client::builder().build().map_err(http_error)?;
         let api_key = api_key.into().trim().to_string();
         if api_key.is_empty() {
             return Err(Error::InvalidConfig("api_key 不能为空".into()));
@@ -53,6 +56,7 @@ impl Provider {
             base_url,
             api_key,
             adapter,
+            timeout: Duration::from_secs(timeout_secs),
             max_retries: 2,
         })
     }
@@ -87,6 +91,7 @@ impl Provider {
             base_url: &self.base_url,
             api_key: &self.api_key,
             model,
+            timeout: self.timeout,
             max_retries: self.max_retries,
         }
     }

@@ -291,6 +291,8 @@ async fn run_react(history: &mut Vec<Message>, ctx: &RunContext<'_>) -> Result<S
             ..
         } = response;
 
+        // 历史和事件各需要一份 owned 数据：只 clone 给历史，原始值 move 进事件，
+        // 避免对整段回复文本做两次深拷贝。provider_data 只有历史需要，直接 move。
         history.push(Message::Assistant {
             content: content.clone(),
             tool_calls: tool_calls.clone(),
@@ -302,7 +304,7 @@ async fn run_react(history: &mut Vec<Message>, ctx: &RunContext<'_>) -> Result<S
         emit(
             ctx.hooks,
             AgentEvent::Assistant {
-                content: content.clone(),
+                content,
                 tool_calls: tool_calls.clone(),
                 usage,
                 finish_reason: finish_reason.clone(),

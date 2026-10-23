@@ -3,6 +3,9 @@ name = "kunpeng-adapter-openai"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 kunpeng-core.workspace = true
 kunpeng-provider.workspace = true
@@ -10,3 +13,6 @@ async-trait.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

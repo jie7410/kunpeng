@@ -10,29 +10,17 @@
 //! - `did:web` DID 文档解析与 service endpoint 发现。
 //!
 //! `@context`、DID service type 和发现策略都可以配置；不同 ANP profile 不需要
-//! 修改 `kunpeng-multi`。
+//! 修改 `kunpeng-multi`。reqwest 错误映射复用 `kunpeng-http`。
 
 use async_trait::async_trait;
-use kunpeng_core::{Error, HttpErrorKind, Result};
-
-fn http_error(error: reqwest::Error) -> Error {
-    let kind = if error.is_timeout() {
-        HttpErrorKind::Timeout
-    } else if error.is_connect() {
-        HttpErrorKind::Connect
-    } else if error.is_body() {
-        HttpErrorKind::Body
-    } else if error.is_request() {
-        HttpErrorKind::Request
-    } else {
-        HttpErrorKind::Other
-    };
-    Error::http_with_source(kind, error.to_string(), error)
-}
+use kunpeng_core::{Error, Result};
+use kunpeng_http::http_error;
 use kunpeng_multi::{AgentEnvelope, AgentProtocol};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{sync::Arc, time::Duration};
+
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// ANP JSON-LD 文档的最小映射。
 ///
@@ -43,6 +31,7 @@ pub struct AnpClient {
     http: reqwest::Client,
     endpoint: String,
     context: Value,
+    timeout: Duration,
 }
 
 /// DID 文档的通用结构。未知字段保留在 `extra`。
@@ -208,6 +197,7 @@ impl AnpClient {
             http: reqwest::Client::new(),
             endpoint: endpoint.into(),
             context: context.into(),
+            timeout: DEFAULT_TIMEOUT,
         }
     }
 
@@ -220,7 +210,14 @@ impl AnpClient {
             http,
             endpoint: endpoint.into(),
             context: context.into(),
+            timeout: DEFAULT_TIMEOUT,
         }
+    }
+
+    /// 覆盖默认的 60 秒请求超时。
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     pub fn endpoint(&self) -> &str {
@@ -241,18 +238,26 @@ impl AnpClient {
         Ok(Self::new(discovered.endpoint, context))
     }
 
-    /// 发送任意 JSON-LD 文档；返回对端 JSON 响应。
+    /// 发送任意 JSON-LD 文档；返回对端 JSON 响应。整次往返受超时限制。
     pub async fn send_document(&self, document: Value) -> Result<Value> {
-        let response = self
-            .http
-            .post(&self.endpoint)
-            .json(&document)
-            .send()
-            .await
-            .map_err(http_error)?
-            .error_for_status()
-            .map_err(http_error)?;
-        let text = response.text().await.map_err(http_error)?;
+        let text = match tokio::time::timeout(self.timeout, async {
+            self.http
+                .post(&self.endpoint)
+                .json(&document)
+                .send()
+                .await
+                .map_err(http_error)?
+                .error_for_status()
+                .map_err(http_error)?
+                .text()
+                .await
+                .map_err(http_error)
+        })
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => return Err(Error::timeout("ANP 请求", self.timeout)),
+        };
         if text.trim().is_empty() {
             return Ok(Value::Null);
         }

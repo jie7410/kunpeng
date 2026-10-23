@@ -50,26 +50,41 @@ impl TokenCounter for ApproxTokenCounter {
                 tool_calls,
                 thinking,
                 citations,
+                server_tool_uses,
+                provider_data,
                 ..
             } => {
+                // provider_data 优先：它是 provider 的原始 block 数组，比展示用的
+                // thinking 字段更完整（含 signature、redacted_thinking 等回传时
+                // 必须占预算的内容）。没有 provider_data 时才单独计 thinking，
+                // 避免两处对同一段思考文本重复计数。
+                let thinking_tokens = match provider_data {
+                    Some(data) => self.count_text(&data.data.to_string()),
+                    None => thinking
+                        .as_deref()
+                        .map(|text| self.count_text(text))
+                        .unwrap_or(0),
+                };
                 content
                     .as_deref()
                     .map(|text| self.count_text(text))
                     .unwrap_or(0)
-                    + thinking
-                        .as_deref()
-                        .map(|text| self.count_text(text))
-                        .unwrap_or(0)
+                    + thinking_tokens
                     + tool_calls
                         .iter()
                         .map(|call| {
-                            self.count_text(&call.name)
+                            self.count_text(&call.id)
+                                + self.count_text(&call.name)
                                 + self.count_text(&call.arguments.to_string())
                         })
                         .sum::<usize>()
                     + citations
                         .iter()
                         .map(|citation| self.count_text(&citation.to_string()))
+                        .sum::<usize>()
+                    + server_tool_uses
+                        .iter()
+                        .map(|tool| self.count_text(&tool.input.to_string()))
                         .sum::<usize>()
             }
             Message::Tool {
@@ -99,5 +114,31 @@ mod tests {
             detail: None,
         }]);
         assert!(counter.count_message(&image) >= IMAGE_TOKENS);
+    }
+
+    #[test]
+    fn provider_data_counts_toward_budget() {
+        use kunpeng_core::types::ProviderData;
+
+        let counter = ApproxTokenCounter;
+        let base = |provider_data| Message::Assistant {
+            content: Some("答案".into()),
+            tool_calls: vec![],
+            thinking: Some("想一想".into()),
+            citations: vec![],
+            server_tool_uses: vec![],
+            provider_data,
+        };
+        // provider_data 序列化后的体积（含 signature 等）比展示字段更大，
+        // 计数必须体现出来，否则长会话会系统性低估用量。
+        let without = counter.count_message(&base(None));
+        let with = counter.count_message(&base(Some(ProviderData::new(
+            "anthropic",
+            serde_json::json!([
+                {"type": "thinking", "thinking": "想一想", "signature": "sig-0123456789"},
+                {"type": "redacted_thinking", "data": "opaque-redacted-block"}
+            ]),
+        ))));
+        assert!(with > without);
     }
 }

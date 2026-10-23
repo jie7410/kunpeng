@@ -5,11 +5,15 @@ edition.workspace = true
 
 [features]
 default = ["tools-builtin"]
-tools-builtin = ["dep:tokio", "dep:reqwest"]
+tools-builtin = ["dep:tokio", "dep:reqwest", "dep:kunpeng-http"]
+
+[lints]
+workspace = true
 
 [dependencies]
 kunpeng-core.workspace = true
 serde_json.workspace = true
+kunpeng-http = { workspace = true, optional = true }
 async-trait.workspace = true
 tokio = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }

@@ -1,31 +1,18 @@
-//! Provider 与具体协议之间的最小接口，以及各协议共用的 HTTP 工具。
+//! Provider 与具体协议之间的最小接口，以及各协议共用的请求工具。
 //!
 //! 这里不持有配置或状态，请求上下文按引用传入，目的是让协议适配器可以在测试里
 //! 用 mock 替换，也避免每个请求复制 base_url/api_key。
+//!
+//! 通用 HTTP 能力（reqwest 错误映射、SSE 解码、限时 body 读取）在 `kunpeng-http`
+//! 里，这里 re-export 是让协议适配器只需要依赖 provider 一个上游。
 
 use async_trait::async_trait;
 use kunpeng_core::error::{Error, ParseResponseError, Result};
 use kunpeng_core::types::{ChatRequest, ChatResponse, StreamControl, StreamDelta};
-use kunpeng_core::HttpErrorKind;
-use reqwest::header::{HeaderMap, CONTENT_TYPE, RETRY_AFTER};
+pub use kunpeng_http::{consume_sse, http_error, is_event_stream, read_body};
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::{RequestBuilder, Response, StatusCode};
 use std::time::Duration;
-
-/// 把 reqwest 传输错误收敛成 core 的结构化错误，同时保留 source。
-pub fn http_error(error: reqwest::Error) -> Error {
-    let kind = if error.is_timeout() {
-        HttpErrorKind::Timeout
-    } else if error.is_connect() {
-        HttpErrorKind::Connect
-    } else if error.is_body() {
-        HttpErrorKind::Body
-    } else if error.is_request() {
-        HttpErrorKind::Request
-    } else {
-        HttpErrorKind::Other
-    };
-    Error::http_with_source(kind, error.to_string(), error)
-}
 
 /// 单次请求的共享上下文。
 ///
@@ -35,6 +22,10 @@ pub struct CallContext<'a> {
     pub base_url: &'a str,
     pub api_key: &'a str,
     pub model: &'a str,
+    /// 单次尝试各等待阶段的上限：等待响应头（含建连）、读取非流式 body、
+    /// 流式响应相邻 chunk 的间隔。不是整次请求的总时长——长流式生成可以合法
+    /// 超过任何总上限，只有某一阶段停滞才应中断。
+    pub timeout: Duration,
     pub max_retries: u32,
 }
 
@@ -96,153 +87,29 @@ pub trait Adapter: Send + Sync {
     }
 }
 
-/// 一条 SSE 事件。`event` 对应 `event:` 字段，`data` 是拼接后的 `data:` 内容。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SseEvent {
-    pub event: Option<String>,
-    pub data: String,
-}
-
-/// 增量 SSE 解码器。
-///
-/// 网络 chunk 不按行切分，可能把一行 JSON、甚至一个 UTF-8 字符切成两半，所以
-/// 这里保留原始字节缓冲，只按 `\n` 取完整行。行内的 `\r` 和 `data:` 后可选空格
-/// 按 SSE 规范处理。
-#[derive(Default)]
-pub(crate) struct SseDecoder {
-    buffer: Vec<u8>,
-    event: Option<String>,
-    data: String,
-}
-
-impl SseDecoder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 喂入一个网络 chunk，返回其中已经完整的事件。
-    pub fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
-        self.buffer.extend_from_slice(chunk);
-        let mut events = Vec::new();
-        while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let mut line: Vec<u8> = self.buffer.drain(..=index).collect();
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            let line = String::from_utf8_lossy(&line);
-            self.process_line(line.as_ref(), &mut events);
-        }
-        events
-    }
-
-    /// 流结束时调用。部分服务端最后一帧没有空行，需要把残留行补处理掉。
-    pub fn finish(&mut self) -> Option<SseEvent> {
-        if !self.buffer.is_empty() {
-            let mut line = std::mem::take(&mut self.buffer);
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            let line = String::from_utf8_lossy(&line);
-            let mut events = Vec::new();
-            self.process_line(line.as_ref(), &mut events);
-            if let Some(event) = events.into_iter().next() {
-                return Some(event);
-            }
-        }
-        self.dispatch()
-    }
-
-    fn process_line(&mut self, line: &str, events: &mut Vec<SseEvent>) {
-        if line.is_empty() {
-            if let Some(event) = self.dispatch() {
-                events.push(event);
-            }
-            return;
-        }
-        // 注释行，例如 `: keep-alive`。
-        if line.starts_with(':') {
-            return;
-        }
-        let Some((field, value)) = line.split_once(':') else {
-            return;
-        };
-        let value = value.strip_prefix(' ').unwrap_or(value);
-        match field {
-            "event" => self.event = Some(value.to_string()),
-            "data" => {
-                if !self.data.is_empty() {
-                    self.data.push('\n');
-                }
-                self.data.push_str(value);
-            }
-            // id/retry 等字段目前用不到；未知字段按规范忽略。
-            _ => {}
-        }
-    }
-
-    fn dispatch(&mut self) -> Option<SseEvent> {
-        if self.data.is_empty() {
-            // 只有 event 没有 data 的事件不完整，直接丢弃，避免把心跳当数据。
-            self.event = None;
-            return None;
-        }
-        Some(SseEvent {
-            event: self.event.take(),
-            data: std::mem::take(&mut self.data),
-        })
-    }
-}
-
-/// 判断响应是否是 SSE。
-///
-/// 有些兼容端点在 `stream=true` 时仍返回普通 JSON；如果直接按 SSE 解码，会得到
-/// 空回复。header 缺失时按 SSE 处理，避免误伤正常流式服务。
-pub fn is_event_stream(response: &Response) -> bool {
-    response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
-        .unwrap_or(true)
-}
-
-/// 逐块读取响应体并解码 SSE 事件。
-///
-/// 用 `Response::chunk()` 而不是引入额外 stream 依赖；LLM SSE 的吞吐量远低于
-/// 每次 chunk 的调度成本。
-pub async fn consume_sse(
-    mut response: Response,
-    mut on_event: impl FnMut(SseEvent) -> Result<()>,
-) -> Result<()> {
-    let mut decoder = SseDecoder::new();
-    while let Some(chunk) = response.chunk().await.map_err(http_error)? {
-        for event in decoder.push(&chunk) {
-            on_event(event)?;
-        }
-    }
-    if let Some(event) = decoder.finish() {
-        on_event(event)?;
-    }
-    Ok(())
-}
-
 /// 对 408/429/5xx 做有上限的重试。
 ///
 /// `make` 每次尝试都会重新构造请求。调用方通常在里面 `.json(&body)`，所以 body
 /// 会在每次重试时重新序列化——这是有意为之：RequestBuilder 的 body 不能跨请求
 /// 复用，且序列化成本远低于一次网络往返。
 ///
+/// `timeout` 限制的是单次尝试从发起到收到响应头的时间（含建连）。非流式 body
+/// 读取由调用方用 `read_body` 限制，流式由 `consume_sse` 的空闲超时限制——不能
+/// 在这里设整次请求的总上限，否则长流式生成会被误杀。传输错误和超时不重试，
+/// 只有明确表示“稍后再试”的状态码才重试。
+///
 /// 退避从 500ms 起翻倍，最多按 2^5 计算；服务端给了 `Retry-After` 时优先用它。
-/// 注意 Client 的总 timeout 是按单次尝试计算的，因此最坏总耗时约为
-/// `timeout * (max_retries + 1)`。
 pub async fn send_with_retry(
     max_retries: u32,
+    timeout: Duration,
     mut make: impl FnMut() -> RequestBuilder + Send,
 ) -> Result<Response> {
     let mut attempt = 0u32;
     loop {
-        let response = make().send().await.map_err(http_error)?;
+        let response = match tokio::time::timeout(timeout, make().send()).await {
+            Ok(result) => result.map_err(http_error)?,
+            Err(_) => return Err(Error::timeout("等待响应头", timeout)),
+        };
         if !is_retryable(response.status()) || attempt >= max_retries {
             return Ok(response);
         }
@@ -322,69 +189,6 @@ pub fn truncate(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn decodes_event_split_across_chunks() {
-        let mut decoder = SseDecoder::new();
-        assert!(decoder
-            .push(b"event: content_block_delta\ndata: {\"a\":")
-            .is_empty());
-
-        let events = decoder.push(b"1}\n\n");
-        assert_eq!(
-            events,
-            vec![SseEvent {
-                event: Some("content_block_delta".into()),
-                data: r#"{"a":1}"#.into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn handles_crlf_comments_and_multiline_data() {
-        let mut decoder = SseDecoder::new();
-        let events = decoder.push(b": keep-alive\r\ndata: first\r\ndata: second\r\n\r\n");
-        assert_eq!(
-            events,
-            vec![SseEvent {
-                event: None,
-                data: "first\nsecond".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn finish_flushes_event_without_trailing_blank_line() {
-        let mut decoder = SseDecoder::new();
-        assert!(decoder.push(b"data: tail").is_empty());
-        assert_eq!(
-            decoder.finish(),
-            Some(SseEvent {
-                event: None,
-                data: "tail".into(),
-            })
-        );
-    }
-
-    #[test]
-    fn split_utf8_is_not_corrupted() {
-        let mut decoder = SseDecoder::new();
-        let payload = "data: 北京\n\n".as_bytes();
-        let split = payload
-            .windows(3)
-            .position(|window| window == "北".as_bytes())
-            .unwrap()
-            + 1;
-        assert!(decoder.push(&payload[..split]).is_empty());
-        let events = decoder.push(&payload[split..]);
-        assert_eq!(
-            events,
-            vec![SseEvent {
-                event: None,
-                data: "北京".into(),
-            }]
-        );
-    }
 
     #[test]
     fn maps_429_to_rate_limited() {

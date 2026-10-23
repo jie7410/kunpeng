@@ -3,6 +3,9 @@ name = "kunpeng-context"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 kunpeng-core.workspace = true
 async-trait.workspace = true
