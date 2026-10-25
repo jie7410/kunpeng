@@ -7,6 +7,7 @@ pub use kunpeng_a2a as a2a;
 pub use kunpeng_adapter_anthropic as adapter_anthropic;
 pub use kunpeng_adapter_openai as adapter_openai;
 pub use kunpeng_agents as agents;
+pub use kunpeng_android as android;
 pub use kunpeng_anp as anp;
 pub use kunpeng_context as context;
 pub use kunpeng_core as core;

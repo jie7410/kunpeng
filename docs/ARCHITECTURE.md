@@ -69,6 +69,7 @@ AdapterRegistry 按名称/别名选择 Adapter；core 不认识厂商。
 | MCP | `crates/kunpeng-mcp/src/` | MCP stdio、tools/resources/prompts/sampling、ToolProvider | 不依赖 Agent/runtime |
 | A2A | `crates/kunpeng-a2a/src/` | Agent Card、message/send、message/stream、tasks/*、push 配置 | 不实现本地 mailbox/webhook server |
 | ANP | `crates/kunpeng-anp/src/` | JSON-LD 信封映射、HTTP 传输、`did:web` 发现 | 不硬编码其他 DID method/厂商 profile |
+| Android | `crates/kunpeng-android/src/` | 诊断领域类型、能力接缝（日志/解析/代码/设备）、Android 工具与 Agent 组装 | 不依赖 provider/UI；adb 与符号索引实现后续按 trait 接入 |
 | 模型抽象 | `crates/kunpeng-core/src/chat_model.rs` | `ChatModel` trait | 不包含 HTTP/厂商协议 |
 | 模型绑定 | `crates/kunpeng-provider/src/model.rs` | `Model`、模型名、默认参数 | 不持有会话历史 |
 | 连接 | `crates/kunpeng-provider/src/provider.rs` | HTTP Client、URL 校验、重试 | 不解析具体协议 |
@@ -134,6 +135,15 @@ crates/
 │   └── src/lib.rs               A2A Agent Card / message/send / tasks/get
 ├── kunpeng-anp/
 │   └── src/lib.rs               ANP JSON-LD HTTP 传输
+├── kunpeng-android/
+│   ├── src/lib.rs               Android 诊断领域层入口
+│   ├── src/types.rs             崩溃报告 / 堆栈帧 / 日志行与会话元数据 / 代码命中 / 设备信息
+│   ├── src/capability/          LogSessionStore / LogProvider / LogParser / CodeIndex / DeviceConnector
+│   ├── src/analysis/            确定性分析：stats / grep / templates / catalog
+│   ├── src/builtin/             离线默认实现（内存会话、静态日志、文件代码索引、Java/ANR 解析器）
+│   ├── src/tools/               log_*（open/sessions/stats/grep/read/cluster）、android_*（crashes/log_parse/code/device）
+│   ├── src/env.rs               AndroidEnv：能力装配 + 工具注册表
+│   └── src/agent.rs             AndroidProfile 预设 + build_agent
 └── kunpeng-cli/
     ├── src/lib.rs               CLI 宿主库入口
     ├── src/config.rs            环境变量 -> LlmConfig
@@ -526,7 +536,8 @@ MCP、A2A、ANP 不进入 core，也不让 runtime 识别协议：
 11. `crates/kunpeng-agents/src/react.rs`：最后看 ReAct 循环。
 12. `crates/kunpeng-multi/src/`：看多智能体消息、AgentProtocol 与 Supervisor。
 13. `crates/kunpeng-mcp` / `kunpeng-a2a` / `kunpeng-anp`：看外部协议如何独立适配。
-14. `crates/kunpeng-provider/src/config.rs`、`crates/kunpeng-cli/src/config.rs` 和 `crates/kunpeng-cli/src/main.rs`：看配置分层和宿主组装。
+14. `crates/kunpeng-android/src/`：看领域层如何只通过 capability trait 组装工具与 Agent。
+15. `crates/kunpeng-provider/src/config.rs`、`crates/kunpeng-cli/src/config.rs` 和 `crates/kunpeng-cli/src/main.rs`：看配置分层和宿主组装。
 
 ---
 
@@ -540,3 +551,4 @@ MCP、A2A、ANP 不进入 core，也不让 runtime 识别协议：
 - 没有内置 shell 工具；高风险命令执行需要自行实现并接入审批
 - 多智能体当前只提供进程内 LocalBus；跨进程同步通信可用 A2A/ANP 适配器，异步接收需要自行把结果投递回 AgentBus
 - 工具审批默认超时 300 秒，可通过 `RunConfig::approval_timeout` 调整
+- `kunpeng-android` 当前为离线模式：`DeviceConnector` 只有占位实现（adb 接入后启用在线排查）；代码检索是文件系统子串扫描；解析器覆盖 Java 崩溃与 ANR 摘要，tombstone/watchdog 待追加；没有修改代码的工具

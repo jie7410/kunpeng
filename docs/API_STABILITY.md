@@ -41,6 +41,13 @@
 - `a2a::A2aClient`、`a2a::PushNotificationConfig`
 - `anp::AnpClient`、`anp::AnpDiscovery`、`anp::HttpDidResolver`
 - `anp::DidResolver`、`anp::DidDocument`、`anp::DidService`
+- `android::types`（`CrashReport`、`StackFrame`、`LogQuery`/`LogSlice`/`LogLine`、`LogSessionMeta`、`CodeQuery`/`CodeHit`/`CodeSnippet`、`DeviceInfo`）
+- `android::capability::{LogSessionStore, LogProvider, LogParser, CompositeLogParser, CodeIndex, DeviceConnector, DeviceLogProvider}`
+- `android::analysis`（`stats`、`grep`、`templates`、`catalog` 纯函数）
+- `android::builtin::{InMemorySessions, StaticLogProvider, FsCodeIndex, JavaCrashParser, AnrParser, UnavailableDeviceConnector}`
+- `android::tools`（`log_*` 会话家族与 `android_*` 语义工具类型）
+- `android::env::{AndroidEnv, AndroidEnvBuilder}`
+- `android::agent::{AndroidProfile, build_agent}`
 
 ### Internal / Adapter
 
@@ -153,6 +160,7 @@ cargo test -p kunpeng-tools
 cargo test -p kunpeng-mcp
 cargo test -p kunpeng-a2a
 cargo test -p kunpeng-anp
+cargo test -p kunpeng-android
 ```
 
 ## PR 检查清单

@@ -20,6 +20,7 @@
 - 取消令牌：中止进行中的模型请求，并保持历史可回放
 - 协议适配：OpenAI Chat Completions / Anthropic Messages
 - 外部 Agent 协议：MCP tools/resources/prompts/sampling、A2A 同步/流式/push 配置、ANP JSON-LD + DID 发现，均为独立 crate
+- Android 诊断领域层：`kunpeng-android` 提供日志会话（open/stats/grep/read/模板聚类）、崩溃/ANR 确定性解析与目录聚合、代码检索定位、离线/在线（adb 预留）能力接缝与 Agent 预设
 - 重试：408/429/5xx 指数退避，尊重 `Retry-After`
 - 配置：宿主层环境变量适配 + 核心程序化 builder；API key 在 `Debug` 输出中脱敏
 - 无 UI 依赖：CLI、Tauri 或测试共用同一套 API
@@ -798,6 +799,57 @@ let reply = supervisor
 
 ---
 
+## Android 诊断 Agent
+
+`kunpeng-android` 把“日志分析、代码定位、日志+代码联合分析”做成可组装的能力，工具只依赖 capability trait，实现可整体替换：
+
+| 接缝 | 默认离线实现 | 计划中的升级实现 |
+|---|---|---|
+| `LogSessionStore` | `InMemorySessions`（会话：打开/切换/关闭 + 行号快照） | 分块/索引式大日志会话 |
+| `LogProvider` | `StaticLogProvider`（预留的实时通道） | adb logcat（经 `DeviceLogProvider` 适配） |
+| `LogParser` | `JavaCrashParser` / `AnrParser` | tombstone、watchdog 解析器 |
+| `CodeIndex` | `FsCodeIndex`（文件系统扫描 + 行区间读取） | tree-sitter 符号索引、ripgrep |
+| `DeviceConnector` | `UnavailableDeviceConnector`（占位） | `AdbConnector`（`adb devices/shell/logcat`） |
+
+确定性分析函数（`analysis` 模块）作用在会话行快照上：统计、多维检索、模板聚类、崩溃目录。
+
+注册给模型的工具（均只读）：
+
+| 工具 | 说明 |
+|---|---|
+| `log_open` | 从文本/文件建立日志会话，返回结构概览（时间范围、buffer、级别分布、崩溃标记行） |
+| `log_sessions` | 会话内务：list / use / close / rename |
+| `log_stats` | 全貌统计：级别/Tag/PID 聚合 top-N、时间范围、崩溃标记行号 |
+| `log_grep` | 多维检索（keyword/tag/pid/level/时间窗）+ 聚合视图 + 上下文窗口 |
+| `log_read` | 按原始行号读取原文段落 |
+| `log_template_cluster` | message 数字/十六进制泛化聚类，输出高频模板 |
+| `android_crashes` | 扫描会话产出崩溃/ANR 目录，按 signature 聚合（次数、首现行号） |
+| `android_log_parse` | 确定性解析日志文本片段，输出结构化崩溃报告 |
+| `android_code_search` / `android_code_read` | 代码库检索与行区间读取 |
+| `android_device_list` / `android_device_shell` | 仅在配置了真实 `DeviceConnector` 后注册；shell 需宿主挂审批 |
+
+规划中的后续工具：`android_event_log_decode`（events buffer 事件解码）、`android_boot_timeline`（启动里程碑与卡点）、`log_cross_timeline`（多源时间线对齐）、`log_diff`（双会话模板差异对比）、`android_perf_signals`（Displayed 耗时/掉帧/StrictMode 等性能信号）。
+
+组装与离线使用：
+
+```rust
+use std::sync::Arc;
+use kunpeng::android::{agent::{build_agent, AndroidProfile}, env::AndroidEnvBuilder};
+use kunpeng::runtime::RunConfig;
+
+let env = AndroidEnvBuilder::offline("./android-repo", crash_log_text)?
+    .build()?;
+let agent = build_agent(model, &env, AndroidProfile::CrashTriage, RunConfig::default())?;
+```
+
+`offline` 会预载一个“默认日志”会话并设为活动；模型也可以在运行中用 `log_open` 继续打开其他日志文件。
+
+在线排查（adb，规划中）不改工具与提示词：实现 `AdbConnector` 后，从设备导出的 logcat 经 `log_open` 进入同一套 `log_*` 工具，`with_device_connector` 注入连接器后设备工具自动注册。
+
+profile 预设：`CrashTriage`（崩溃分诊）、`CodeOptimize`（代码优化建议）、`OnlineDiagnosis`（在线排查，要求已配置设备连接器）。三者共享同一工具集，差异在 system prompt 的作业流程与输出约束（结论先行、证据引用 `path:line` / 行号、只读声明）。
+
+---
+
 ## 协议适配
 
 三个协议各自独立 crate，不进入 core，也不要求 runtime/agents 认识它们。
@@ -903,6 +955,7 @@ crates/
 ├── kunpeng-mcp/            MCP stdio 客户端 / ToolProvider
 ├── kunpeng-a2a/            A2A HTTP JSON-RPC 客户端
 ├── kunpeng-anp/            ANP JSON-LD HTTP 传输
+├── kunpeng-android/        Android 诊断：能力接缝 + 离线实现 + 工具 + Agent 预设
 └── kunpeng-cli/            env 配置适配 + interactive CLI + examples
 docs/
 ├── README.md               文档索引
@@ -942,6 +995,7 @@ cargo test -p kunpeng-multi
 cargo test -p kunpeng-mcp
 cargo test -p kunpeng-a2a
 cargo test -p kunpeng-anp
+cargo test -p kunpeng-android
 ```
 
 当前测试覆盖：
@@ -957,6 +1011,12 @@ cargo test -p kunpeng-anp
 - 记忆：内存检索、RAG 注入、SessionStore 往返
 - 工具：策略超时/截断、fs 沙箱、http allowlist、time
 - 多智能体：LocalBus 路由、Supervisor Task/Result、correlation id
+- Android 诊断：Java 崩溃/ANR 解析（thread-time 与带 PID 括号两种行格式、Caused by 链、应用帧判定）、
+  会话存储生命周期（打开/切换/关闭回退/改名/文件沙箱越界拒绝）、
+  log_open 概览、log_stats 聚合、log_grep 五种视图（分页/聚合/时间窗/上下文标记）、log_read 分页、
+  模板聚类数字与十六进制泛化、崩溃目录按 signature 聚合、
+  代码检索/行区间读取/沙箱越界拒绝、
+  设备工具按连接器配置注册、`DeviceLogProvider` 委派、OnlineDiagnosis 一致性校验、mock 模型端到端崩溃分诊
 - 配置默认值、API key 脱敏、工具注册校验
 - `Message` serde 往返
 
@@ -968,6 +1028,7 @@ cargo test -p kunpeng-anp
 - Anthropic 的未知 delta（除 text/thinking/signature/input_json/citations 外）不进入语义字段，原始 block 仍会保留
 - 当前只有 InMemory Memory/SessionStore；向量检索和生产持久化需要实现对应 trait
 - 没有内置 shell 工具；高风险命令执行需要自行实现并接入审批
+- `kunpeng-android` 为离线模式：adb 连接器、tombstone/watchdog 解析器、符号级检索与代码修改工具均为后续按 trait 接入的预留项
 
 ---
 

@@ -30,6 +30,7 @@ kunpeng-rag = { path = "crates/kunpeng-rag" }
 kunpeng-mcp = { path = "crates/kunpeng-mcp" }
 kunpeng-a2a = { path = "crates/kunpeng-a2a" }
 kunpeng-anp = { path = "crates/kunpeng-anp" }
+kunpeng-android = { path = "crates/kunpeng-android" }
 
 [workspace.lints.rust]
 # 全库不使用 unsafe；新增 crate 自动继承，无需逐文件声明。
