@@ -52,6 +52,8 @@ impl AndroidProfile {
                  3. 优先检查应用帧（app_frames）：android_code_search 按类名定位文件，\
                  android_code_read 读取 file:line 附近上下文（建议前后各 20 行）。\n\
                  4. 结合 Caused by 链与源码给出根因假设。\n\
+                 5. 补充证据：进程生死与查杀看 android_event_log_decode（name=am_）；\
+                 疑似内存压力看 android_perf_signals 的 LMK/GC 信号。\n\
                  \n\
                  输出要求：\n\
                  - 结论先行：崩溃类别、根因假设、置信度（高/中/低）。\n\
@@ -66,9 +68,11 @@ impl AndroidProfile {
                  \n\
                  作业流程：\n\
                  1. 用 android_code_search / android_code_read 收集目标代码与调用点。\n\
-                 2. 如有运行期日志：android_crashes 看崩溃/ANR，log_grep 检索相关进程，\
-                 log_template_cluster 看重复模式（高频重试往往是性能问题线索）。\n\
-                 3. 从正确性、性能（主线程/内存/电量）、可维护性三个维度评估。\n\
+                 2. 如有运行期日志：android_perf_signals 看启动耗时/掉帧/StrictMode/GC/LMK，\
+                 android_crashes 看崩溃/ANR，log_template_cluster 看重复模式（高频重试往往是性能问题线索）。\n\
+                 3. 有两份日志（如修复前后、正常机 vs 问题机）时，用 log_open 分别打开、\
+                 log_sessions 改标签，再 log_diff 对比差异。\n\
+                 4. 从正确性、性能（主线程/内存/电量）、可维护性三个维度评估。\n\
                  \n\
                  输出要求：\n\
                  - 每条建议包含：问题、证据（path:line / 行号）、改法（可用 diff 风格描述）、风险与权衡。\n\
@@ -85,8 +89,10 @@ impl AndroidProfile {
                  2. 需要系统状态时用 android_device_shell 执行只读命令（dumpsys、pm list、\
                  cat /data/anr/、logcat -d 导出等）；命令可能被宿主审批拒绝，被拒后换只读方案。\n\
                  3. 导出的日志用 log_open 建会话，android_crashes 拿崩溃目录，\
-                 log_grep/log_read 检索定位。\n\
-                 4. 定位到代码后用 android_code_search / android_code_read 交叉验证。\n\
+                 log_grep/log_read 检索定位；多份导出（main/events/kernel）用 log_cross_timeline 对齐。\n\
+                 4. 启动慢/开机问题用 android_boot_timeline 看里程碑卡点、\
+                 android_perf_signals 看 Displayed 耗时与掉帧。\n\
+                 5. 定位到代码后用 android_code_search / android_code_read 交叉验证。\n\
                  \n\
                  输出要求：\n\
                  - 结论先行 + 证据（path:line / 行号 / signature / 命令输出摘录）。\n\

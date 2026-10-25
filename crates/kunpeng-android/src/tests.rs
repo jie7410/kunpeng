@@ -21,7 +21,10 @@ use crate::capability::{
 use crate::env::AndroidEnvBuilder;
 use crate::tools::cluster::TemplateClusterTool;
 use crate::tools::crash::CrashCatalogTool;
+use crate::tools::cross::{CrossTimelineTool, LogDiffTool};
+use crate::tools::events::{BootTimelineTool, EventDecodeTool};
 use crate::tools::log::{LogGrepTool, LogOpenTool, LogReadTool, LogSessionsTool, LogStatsTool};
+use crate::tools::perf::PerfSignalsTool;
 use crate::types::{CodeQuery, DeviceInfo, DeviceState, LogLine, LogQuery, LogSlice};
 
 const SAMPLE_CRASH: &str = "\
@@ -409,10 +412,15 @@ fn offline_env_registers_log_family_tools() {
     assert_eq!(
         names,
         [
+            "android_boot_timeline",
             "android_code_read",
             "android_code_search",
             "android_crashes",
+            "android_event_log_decode",
             "android_log_parse",
+            "android_perf_signals",
+            "log_cross_timeline",
+            "log_diff",
             "log_grep",
             "log_open",
             "log_read",
@@ -433,7 +441,7 @@ fn device_tools_registered_only_with_connector() {
         .build()
         .unwrap();
     let registry = env.tool_registry().unwrap();
-    assert_eq!(registry.definitions().len(), 12);
+    assert_eq!(registry.definitions().len(), 17);
     assert!(registry
         .definitions()
         .iter()
@@ -560,6 +568,193 @@ async fn device_log_provider_delegates_to_connector() {
         ["emulator-5554"]
     );
     assert!(provider.describe().contains("emulator-5554"));
+}
+
+// ---------- 阶段二：语义分析工具 ----------
+
+/// events buffer 样本：4 个启动里程碑 + am_proc_start/am_kill。
+const BOOT_EVENTS_LOG: &str = "\
+--------- beginning of events
+10-25 08:00:05.000  0  0 I boot_progress_start: [5000]
+10-25 08:00:13.000  0  0 I boot_progress_system_run: [13000]
+10-25 08:00:41.000  0  0 I boot_progress_pms_ready: [41000]
+10-25 08:01:15.000  0  0 I boot_progress_enable_screen: [75000]
+10-25 08:00:20.000  1000  2000 I am_proc_start: [1000,12345,com.example.app,activity]
+10-25 08:00:22.000  1000  2000 I am_kill: [0,12345,com.example.app,900,10]
+";
+
+const PERF_SAMPLE_LOG: &str = "\
+10-25 08:01:30.100  1000  2050 I ActivityTaskManager: Displayed com.example.app/.MainActivity: +3s456ms
+10-25 08:01:35.100  1234  5678 I Choreographer: Skipped 120 frames!  (taking 2041ms)
+10-25 08:01:36.100  1234  5678 D StrictMode policy violation: ~NetworkOnMainThreadOperation
+10-25 08:01:37.100  1234  5678 I art: Background concurrent copying GC freed 10MB
+10-25 08:01:38.100  1000  1500 I lowmemorykiller: Kill 'com.example.app' (12345)
+";
+
+async fn open_session(label: &str, log: &str) -> (Arc<dyn LogSessionStore>, String) {
+    let root = temp_repo();
+    let store = InMemorySessions::new(Some(&root)).unwrap();
+    let id = store.preload(label, log).unwrap();
+    (Arc::new(store), id)
+}
+
+#[tokio::test]
+async fn event_decode_tool_decodes_and_filters() {
+    let (sessions, _) = open_session("boot", BOOT_EVENTS_LOG).await;
+    let tool = EventDecodeTool::new(sessions);
+
+    let output = parse_output(&tool.call(serde_json::json!({})).await.unwrap());
+    assert_eq!(output["total"], 6);
+
+    // name 过滤 + 字段命名。
+    let output = parse_output(
+        &tool
+            .call(serde_json::json!({ "name": "am_proc_start" }))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(output["total"], 1);
+    let fields = &output["events"][0]["fields"];
+    assert_eq!(fields[0]["name"], "uid");
+    assert_eq!(fields[2]["name"], "processName");
+    assert_eq!(fields[2]["value"], "com.example.app");
+}
+
+#[tokio::test]
+async fn boot_timeline_tool_reports_milestones_and_gaps() {
+    let (sessions, _) = open_session("boot", BOOT_EVENTS_LOG).await;
+    let tool = BootTimelineTool::new(sessions);
+    let output = parse_output(&tool.call(serde_json::json!({})).await.unwrap());
+
+    let milestones = output["milestones"].as_array().unwrap();
+    assert_eq!(milestones.len(), 4, "am_* 事件不是里程碑");
+    assert_eq!(milestones[0]["name"], "boot_progress_start");
+
+    let gaps = output["slowest_gaps"].as_array().unwrap();
+    assert_eq!(
+        gaps[0]["gap"],
+        "boot_progress_pms_ready -> boot_progress_enable_screen"
+    );
+    assert_eq!(gaps[0]["ms"], 34000);
+}
+
+#[tokio::test]
+async fn perf_signals_tool_groups_by_kind() {
+    let (sessions, _) = open_session("perf", PERF_SAMPLE_LOG).await;
+    let tool = PerfSignalsTool::new(sessions);
+    let output = parse_output(&tool.call(serde_json::json!({})).await.unwrap());
+
+    let signals = output["signals"].as_array().unwrap();
+    let kinds: Vec<&str> = signals
+        .iter()
+        .map(|group| group["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "app_displayed",
+            "skipped_frames",
+            "strict_mode",
+            "gc_pressure",
+            "lmk_kill"
+        ]
+    );
+    assert_eq!(signals[0]["entries"][0]["value_ms"], 3456);
+    assert_eq!(signals[4]["entries"][0]["process"], "com.example.app");
+}
+
+#[tokio::test]
+async fn cross_timeline_tool_merges_sessions() {
+    let root = temp_repo();
+    let store = InMemorySessions::new(Some(&root)).unwrap();
+    store
+        .preload(
+            "main",
+            "10-25 08:00:02.000  1  1 I Main: second\n10-25 08:00:00.000  1  1 I Main: first",
+        )
+        .unwrap();
+    store
+        .open_text(
+            "events",
+            "10-25 08:00:01.000  0  0 I boot_progress_x: [1000]",
+        )
+        .await
+        .unwrap();
+    let sessions: Arc<dyn LogSessionStore> = Arc::new(store);
+    let tool = CrossTimelineTool::new(sessions);
+
+    // 缺省归并全部会话，按时间排序。
+    let output = parse_output(&tool.call(serde_json::json!({})).await.unwrap());
+    let entries = output["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert!(entries[0]["raw"].as_str().unwrap().contains("first"));
+    assert_eq!(entries[1]["session"], "events");
+    assert!(entries[2]["raw"].as_str().unwrap().contains("second"));
+
+    // keyword 过滤。
+    let output = parse_output(
+        &tool
+            .call(serde_json::json!({ "keyword": "boot_progress" }))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(output["entries"].as_array().unwrap().len(), 1);
+
+    // 单会话不满足对齐条件。
+    let error = tool
+        .call(serde_json::json!({ "sessions": ["s1"] }))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, kunpeng_core::Error::InvalidTool { .. }));
+}
+
+#[tokio::test]
+async fn log_diff_tool_reports_sections() {
+    let root = temp_repo();
+    let store = InMemorySessions::new(Some(&root)).unwrap();
+    let baseline = store
+        .preload(
+            "baseline",
+            "10-25 08:00:00.001  1  1 D App: retry 1 failed\n\
+             10-25 08:00:00.002  1  1 D App: retry 2 failed\n\
+             10-25 08:00:00.003  1  1 D App: cache hit rate 0.9",
+        )
+        .unwrap();
+    let target = store
+        .open_text(
+            "target",
+            "10-25 08:10:00.001  1  1 D App: retry 1 failed\n\
+             10-25 08:10:00.002  1  1 D App: retry 2 failed\n\
+             10-25 08:10:00.003  1  1 D App: retry 3 failed\n\
+             10-25 08:10:00.004  1  1 D App: new error 42",
+        )
+        .await
+        .unwrap()
+        .id;
+    let sessions: Arc<dyn LogSessionStore> = Arc::new(store);
+    let tool = LogDiffTool::new(sessions);
+
+    let output = parse_output(
+        &tool
+            .call(serde_json::json!({ "baseline": baseline, "target": target }))
+            .await
+            .unwrap(),
+    );
+    let missing = output["missing_in_target"].as_array().unwrap();
+    assert!(missing.len() == 1 && missing[0][0].as_str().unwrap().contains("cache"));
+    let new_templates = output["new_in_target"].as_array().unwrap();
+    assert!(new_templates
+        .iter()
+        .any(|item| item[0].as_str().unwrap().contains("new error")));
+    let changed = output["changed"].as_array().unwrap();
+    assert_eq!(changed[0]["baseline"], 2);
+    assert_eq!(changed[0]["target"], 3);
+
+    // 同一会话不可自比。
+    assert!(tool
+        .call(serde_json::json!({ "baseline": baseline, "target": baseline }))
+        .await
+        .is_err());
 }
 
 // ---------- 端到端 ----------

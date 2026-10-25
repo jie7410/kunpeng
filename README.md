@@ -811,7 +811,7 @@ let reply = supervisor
 | `CodeIndex` | `FsCodeIndex`（文件系统扫描 + 行区间读取） | tree-sitter 符号索引、ripgrep |
 | `DeviceConnector` | `UnavailableDeviceConnector`（占位） | `AdbConnector`（`adb devices/shell/logcat`） |
 
-确定性分析函数（`analysis` 模块）作用在会话行快照上：统计、多维检索、模板聚类、崩溃目录。
+确定性分析函数（`analysis` 模块）作用在会话行快照上：统计、多维检索、模板聚类、崩溃目录、事件解码、启动时间线、多源对齐、双会话差异、性能信号。
 
 注册给模型的工具（均只读）：
 
@@ -825,10 +825,15 @@ let reply = supervisor
 | `log_template_cluster` | message 数字/十六进制泛化聚类，输出高频模板 |
 | `android_crashes` | 扫描会话产出崩溃/ANR 目录，按 signature 聚合（次数、首现行号） |
 | `android_log_parse` | 确定性解析日志文本片段，输出结构化崩溃报告 |
+| `android_event_log_decode` | 解码 events buffer 事件，已知事件按字段命名（am_\*/boot_progress_\* 等），未知透传 |
+| `android_boot_timeline` | 启动里程碑（elapsedMs + 相邻间隔）、最大卡点段、main buffer 启动标记 |
+| `android_perf_signals` | 性能信号聚合：Displayed 启动耗时、掉帧、StrictMode、GC 压力、LMK 查杀 |
+| `log_cross_timeline` | 多会话按时间戳归并成统一时间线（要求时间戳格式一致） |
+| `log_diff` | 双会话模板差异：新增/消失/频次剧变的模式（问题机 vs 正常机） |
 | `android_code_search` / `android_code_read` | 代码库检索与行区间读取 |
 | `android_device_list` / `android_device_shell` | 仅在配置了真实 `DeviceConnector` 后注册；shell 需宿主挂审批 |
 
-规划中的后续工具：`android_event_log_decode`（events buffer 事件解码）、`android_boot_timeline`（启动里程碑与卡点）、`log_cross_timeline`（多源时间线对齐）、`log_diff`（双会话模板差异对比）、`android_perf_signals`（Displayed 耗时/掉帧/StrictMode 等性能信号）。
+日志分析工具链至此完整覆盖“打开 → 全貌 → 检索 → 原文 → 语义目录 → 聚类 → 关联 → 对比”。后续预留：tombstone/watchdog 解析器、`AdbConnector` 在线排查、`logcat -f` 实时订阅、崩溃指纹知识库检索。
 
 组装与离线使用：
 
@@ -1015,6 +1020,11 @@ cargo test -p kunpeng-android
   会话存储生命周期（打开/切换/关闭回退/改名/文件沙箱越界拒绝）、
   log_open 概览、log_stats 聚合、log_grep 五种视图（分页/聚合/时间窗/上下文标记）、log_read 分页、
   模板聚类数字与十六进制泛化、崩溃目录按 signature 聚合、
+  event 解码（已知事件字段命名/未知透传/嵌套与引号 payload）、
+  启动时间线（里程碑排序/间隔/最大卡点/wall 标记）、
+  多源时间线归并（wall/epoch 两种时间键、混用拒绝、keyword 过滤）、
+  双会话差异（新增/消失/频次变化）、
+  性能信号（Displayed 时长解析/掉帧/StrictMode/GC/LMK 聚合）、
   代码检索/行区间读取/沙箱越界拒绝、
   设备工具按连接器配置注册、`DeviceLogProvider` 委派、OnlineDiagnosis 一致性校验、mock 模型端到端崩溃分诊
 - 配置默认值、API key 脱敏、工具注册校验

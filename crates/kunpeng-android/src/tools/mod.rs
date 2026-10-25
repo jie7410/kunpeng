@@ -10,8 +10,11 @@
 pub mod cluster;
 pub mod code;
 pub mod crash;
+pub mod cross;
 pub mod device;
+pub mod events;
 pub mod log;
+pub mod perf;
 
 use kunpeng_core::{Error, Result};
 use serde_json::Value;

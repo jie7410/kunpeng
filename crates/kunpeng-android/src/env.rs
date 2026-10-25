@@ -19,8 +19,11 @@ use crate::capability::{
 use crate::tools::cluster::TemplateClusterTool;
 use crate::tools::code::{CodeReadTool, CodeSearchTool};
 use crate::tools::crash::{CrashCatalogTool, LogParseTool};
+use crate::tools::cross::{CrossTimelineTool, LogDiffTool};
 use crate::tools::device::{DeviceListTool, DeviceShellTool};
+use crate::tools::events::{BootTimelineTool, EventDecodeTool};
 use crate::tools::log::{LogGrepTool, LogOpenTool, LogReadTool, LogSessionsTool, LogStatsTool};
+use crate::tools::perf::PerfSignalsTool;
 
 /// 一套已装配的诊断能力。
 ///
@@ -66,7 +69,8 @@ impl AndroidEnv {
 
     /// 生成 Android 工具注册表。
     ///
-    /// 日志家族（open/sessions/stats/grep/read/template_cluster）+ 崩溃工具 +
+    /// 日志家族（open/sessions/stats/grep/read/template_cluster/diff/cross_timeline）+
+    /// 语义工具（log_parse/crashes/event_decode/boot_timeline/perf_signals）+
     /// 代码工具总是注册；设备 2 个工具仅在配置了真实连接器时注册，避免离线
     /// 模式下模型调用必然失败的工具。
     pub fn tool_registry(&self) -> Result<ToolRegistry> {
@@ -82,6 +86,11 @@ impl AndroidEnv {
             self.sessions.clone(),
             self.parser.clone(),
         ))?;
+        registry.register(EventDecodeTool::new(self.sessions.clone()))?;
+        registry.register(BootTimelineTool::new(self.sessions.clone()))?;
+        registry.register(PerfSignalsTool::new(self.sessions.clone()))?;
+        registry.register(CrossTimelineTool::new(self.sessions.clone()))?;
+        registry.register(LogDiffTool::new(self.sessions.clone()))?;
         registry.register(CodeSearchTool::new(self.code.clone()))?;
         registry.register(CodeReadTool::new(self.code.clone()))?;
         if self.device_tools {

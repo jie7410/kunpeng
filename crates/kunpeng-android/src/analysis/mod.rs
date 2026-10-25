@@ -4,7 +4,12 @@
 //! 这里整体替换为查询引擎 trait，工具签名与提示词不变（对应 capability
 //! 层 `LogSessionStore` 的演进路线）。
 
+pub mod boot;
 pub mod catalog;
+pub mod cross;
+pub mod diff;
+pub mod events;
 pub mod grep;
+pub mod perf;
 pub mod stats;
 pub mod templates;

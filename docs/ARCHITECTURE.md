@@ -139,7 +139,7 @@ crates/
 │   ├── src/lib.rs               Android 诊断领域层入口
 │   ├── src/types.rs             崩溃报告 / 堆栈帧 / 日志行与会话元数据 / 代码命中 / 设备信息
 │   ├── src/capability/          LogSessionStore / LogProvider / LogParser / CodeIndex / DeviceConnector
-│   ├── src/analysis/            确定性分析：stats / grep / templates / catalog
+│   ├── src/analysis/            确定性分析：stats / grep / templates / catalog / events / boot / cross / diff / perf
 │   ├── src/builtin/             离线默认实现（内存会话、静态日志、文件代码索引、Java/ANR 解析器）
 │   ├── src/tools/               log_*（open/sessions/stats/grep/read/cluster）、android_*（crashes/log_parse/code/device）
 │   ├── src/env.rs               AndroidEnv：能力装配 + 工具注册表

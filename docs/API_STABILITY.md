@@ -43,7 +43,7 @@
 - `anp::DidResolver`、`anp::DidDocument`、`anp::DidService`
 - `android::types`（`CrashReport`、`StackFrame`、`LogQuery`/`LogSlice`/`LogLine`、`LogSessionMeta`、`CodeQuery`/`CodeHit`/`CodeSnippet`、`DeviceInfo`）
 - `android::capability::{LogSessionStore, LogProvider, LogParser, CompositeLogParser, CodeIndex, DeviceConnector, DeviceLogProvider}`
-- `android::analysis`（`stats`、`grep`、`templates`、`catalog` 纯函数）
+- `android::analysis`（`stats`、`grep`、`templates`、`catalog`、`events`、`boot`、`cross`、`diff`、`perf` 纯函数）
 - `android::builtin::{InMemorySessions, StaticLogProvider, FsCodeIndex, JavaCrashParser, AnrParser, UnavailableDeviceConnector}`
 - `android::tools`（`log_*` 会话家族与 `android_*` 语义工具类型）
 - `android::env::{AndroidEnv, AndroidEnvBuilder}`
